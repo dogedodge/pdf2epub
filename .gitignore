@@ -4,6 +4,8 @@ __pycache__/
 venv/
 output/
 experiments/
+*_work/
+work/
 *.pdf
 *.epub
 .DS_Store
