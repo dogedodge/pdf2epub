@@ -1,0 +1,6 @@
+mineru==4.0.10        # layout + OCR (ONNX PP-DocLayoutV2 + PP-OCRv6); pulls onnxruntime, docvortex
+pymupdf==1.28.2       # PDF inspection + page rendering
+EbookLib==0.20        # EPUB 3 writer
+pillow                # cropping
+# optional: only for experimenting with other MinerU backends; NOT needed for --tier basic/standard on CPU
+# torch/torchvision CPU wheels: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
