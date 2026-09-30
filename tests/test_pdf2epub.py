@@ -209,24 +209,95 @@ class TestBuildFromProject(unittest.TestCase):
                 self.assertGreaterEqual(len(chaps), 2)
 
 
+class TestProofreadParsing(unittest.TestCase):
+    def test_extract_strips_narration_and_markers(self):
+        original = "# 理论基础\n\n正文。\n"
+        raw = (
+            "Everything else matches the image.\n\n"
+            "---BEGIN PAGE.MD---\n"
+            "# 理论基础\n\n正文。\n"
+            "---END PAGE.MD---\n"
+        )
+        self.assertEqual(pdf2epub.extract_page_markdown(raw, original), original)
+
+    def test_extract_from_first_heading_without_markers(self):
+        original = "# 理论基础\n\n正文。\n"
+        raw = "Comparing the OCR text against the page image…\n\n# 理论基础\n\n正文。\n"
+        self.assertEqual(pdf2epub.extract_page_markdown(raw, original), original)
+
+    def test_trailing_no_changes(self):
+        original = "# 理论基础\n\n正文。\n"
+        self.assertEqual(
+            pdf2epub.extract_page_markdown("No OCR errors found.\nNO_CHANGES", original),
+            "NO_CHANGES",
+        )
+        self.assertEqual(
+            pdf2epub.extract_page_markdown("…matches the image.NO_CHANGES", original),
+            "NO_CHANGES",
+        )
+
+    def test_reject_unrelated_output(self):
+        original = "# 理论基础\n\n正文。\n"
+        self.assertIsNone(pdf2epub.extract_page_markdown("Here is a summary of the page.", original))
+
+    def test_parse_stream_json_keeps_last_assistant_after_tools(self):
+        events = [
+            {"type": "system", "subtype": "init", "model": "claude-sonnet-5-thinking-high"},
+            {"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "Comparing…"}]}},
+            {"type": "tool_call", "subtype": "started", "tool_call": {"readToolCall": {"args": {"path": "page.png"}}}},
+            {"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "Between tools."}]}},
+            {"type": "tool_call", "subtype": "completed", "tool_call": {"readToolCall": {"args": {"path": "page.png"}}}},
+            {"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "NO_CHANGES"}]}},
+            {"type": "result", "subtype": "success", "duration_ms": 161000,
+             "result": "Comparing…Between tools.NO_CHANGES",
+             "usage": {"inputTokens": 10, "outputTokens": 3}},
+        ]
+        stdout = "".join(json.dumps(e) + "\n" for e in events)
+        parsed = pdf2epub.parse_stream_json(stdout)
+        self.assertEqual(parsed["text"], "NO_CHANGES")
+        self.assertEqual(parsed["model"], "claude-sonnet-5-thinking-high")
+        self.assertEqual(parsed["duration_ms"], 161000)
+        self.assertEqual(parsed["usage"]["inputTokens"], 10)
+
+    def test_classify_punct_vs_insert_vs_rewrite(self):
+        applied, sug = pdf2epub.classify_and_apply("因素—基础的", "因素——基础的")
+        self.assertEqual(applied, "因素——基础的")
+        self.assertEqual(sug, [])
+        applied, sug = pdf2epub.classify_and_apply("最大。趋势", "最大。等趋势")
+        self.assertEqual(applied, "最大。趋势")
+        self.assertEqual(sug[0]["type"], "insert")
+        self.assertEqual(sug[0]["text"], "等")
+        applied, sug = pdf2epub.classify_and_apply("期货商", "交易商")
+        self.assertEqual(applied, "期货商")
+        self.assertEqual(sug[0]["type"], "replace")
+
+
 class TestProofreadMock(unittest.TestCase):
-    def _run(self, project: Path, extra=None, env=None):
+    def _run(self, project: Path, extra=None, env=None, cwd=None):
         cmd = ["proofread", "--project", str(project), "--agent-bin", str(FAKE_AGENT),
                "--timeout", "5"]
         if extra:
             cmd.extend(extra)
         old = os.environ.copy()
+        old_cwd = os.getcwd()
         try:
             if env:
                 os.environ.update(env)
+            if cwd:
+                os.chdir(cwd)
             return pdf2epub.main(cmd)
         finally:
+            os.chdir(old_cwd)
             os.environ.clear()
             os.environ.update(old)
 
-    def test_applies_fixes_and_keeps_ocr_original(self):
+    def test_applies_punct_keeps_insertions_as_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
+            argv_file = tmp / "argv.json"
             project = make_project(tmp, [
                 {"items": [
                     {"kind": "heading", "level": 1, "text": "标题"},
@@ -236,25 +307,213 @@ class TestProofreadMock(unittest.TestCase):
                 ]},
             ])
             ocr_before = (project / "pages/0001/page.ocr.md").read_text(encoding="utf-8")
-            rc = self._run(project)
+            rc = self._run(project, extra=["--api-key", "super-secret"],
+                           env={"FAKE_AGENT_ARGV_FILE": str(argv_file)})
             self.assertEqual(rc, 0)
             md = (project / "pages/0001/page.md").read_text(encoding="utf-8")
             ocr_after = (project / "pages/0001/page.ocr.md").read_text(encoding="utf-8")
             self.assertEqual(ocr_before, ocr_after)
-            self.assertIn("等趋势发展过一段之后", md)
             self.assertIn("因素——基础的", md)
-            self.assertIn("标记校正结束", md)
+            self.assertNotIn("等趋势发展过一段之后", md)
+            self.assertIn("OCR_ERROR_FOO", md)
+            rec = json.loads((project / "pages/0001/proofread.json").read_text(encoding="utf-8"))
+            self.assertEqual(rec["status"], "done")
+            self.assertTrue(rec.get("model"))
+            self.assertIsNotNone(rec.get("duration_ms"))
+            self.assertIsNotNone(rec.get("usage"))
+            self.assertIsNotNone(rec.get("wall_ms"))
+            self.assertRegex(rec.get("time") or "", r"[+-]\d{2}:\d{2}$")
             report = (project / "proofread/report.md").read_text(encoding="utf-8")
-            self.assertIn("Page 0001", report)
-            self.assertIn("changed", report)
-            self.assertTrue((project / "proofread/diffs/0001.diff").exists())
-            self.assertTrue((project / "pages/0001/proofread.json").exists())
+            self.assertIn("generated (local)", report)
+            self.assertIn("insert", report)
+            self.assertIn("等", report)
+            argv = json.loads(argv_file.read_text(encoding="utf-8"))
+            self.assertNotIn("--api-key", argv["argv"])
+            self.assertIsNone(argv.get("api_key_flag"))
+            self.assertTrue(argv["env_has_cursor_api_key"])
+            self.assertEqual(argv["sandbox"], "enabled")
+            self.assertEqual(argv["output_format"], "stream-json")
+            self.assertTrue(Path(argv["workspace"]).is_absolute())
+            self.assertTrue((Path(argv["workspace"]) / "page.md").exists())
+            self.assertTrue((Path(argv["workspace"]) / ".cursor" / "cli.json").exists())
 
-            # resumable: second run skips
             rc = self._run(project)
             self.assertEqual(rc, 0)
             results = json.loads((project / "proofread/results.json").read_text(encoding="utf-8"))
-            self.assertEqual(results[0]["status"], "skipped")
+            # skip keeps the previous substantive result
+            self.assertEqual(results[0]["status"], "changed")
+
+    def test_relative_project_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "test-run").mkdir()
+            project = make_project(tmp / "test-run", [
+                {"items": [{"kind": "heading", "level": 1, "text": "标题"},
+                           {"kind": "para", "text": "因素—基础的。"}]},
+            ])
+            argv_file = tmp / "argv.json"
+            rc = self._run(Path("test-run/book_work"), extra=["--timeout", "5"],
+                           env={"FAKE_AGENT_ARGV_FILE": str(argv_file)}, cwd=str(tmp))
+            self.assertEqual(rc, 0, argv_file.read_text() if argv_file.exists() else "no argv log")
+            argv = json.loads(argv_file.read_text(encoding="utf-8"))
+            ws = Path(argv["workspace"])
+            self.assertTrue(ws.is_absolute())
+            self.assertTrue((ws / "page.md").exists())
+            self.assertEqual(ws.name, "0001")
+            md = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertIn("——", md)
+
+    def test_narration_before_between_after_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [
+                    {"kind": "heading", "level": 1, "text": "理论基础"},
+                    {"kind": "para", "text": "因素—基础的讨论。"},
+                ]},
+            ])
+            rc = self._run(project, env={"FAKE_AGENT_BEHAVIOR": "narrate"})
+            self.assertEqual(rc, 0)
+            md = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertNotIn("Comparing", md)
+            self.assertNotIn("Everything else matches", md)
+            self.assertIn("# 理论基础", md)
+            self.assertIn("因素——基础的", md)
+
+    def test_trailing_no_changes_is_unchanged_not_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [
+                    {"kind": "heading", "level": 1, "text": "理论基础"},
+                    {"kind": "para", "text": "正文。"},
+                ]},
+            ])
+            before = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            rc = self._run(project, env={"FAKE_AGENT_BEHAVIOR": "trailing_no_changes"})
+            self.assertEqual(rc, 0)
+            after = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            rec = json.loads((project / "pages/0001/proofread.json").read_text(encoding="utf-8"))
+            self.assertEqual(rec["status"], "done")
+            self.assertFalse(rec["changed"])
+            report = (project / "proofread/report.md").read_text(encoding="utf-8")
+            self.assertIn("unchanged", report)
+            self.assertIn("- failed: 0", report)
+
+    def test_only_page_merges_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [{"kind": "heading", "level": 1, "text": "一"},
+                           {"kind": "para", "text": "因素—甲。"}]},
+                {"items": [{"kind": "heading", "level": 2, "text": "二"},
+                           {"kind": "para", "text": "因素—乙。"}]},
+            ])
+            rc = self._run(project, extra=["--only-page", "1"])
+            self.assertEqual(rc, 0)
+            results = json.loads((project / "proofread/results.json").read_text(encoding="utf-8"))
+            self.assertEqual([r["page"] for r in results], ["0001"])
+            rc = self._run(project, extra=["--only-page", "2"])
+            self.assertEqual(rc, 0)
+            results = json.loads((project / "proofread/results.json").read_text(encoding="utf-8"))
+            pages = sorted(r["page"] for r in results)
+            self.assertEqual(pages, ["0001", "0002"])
+            report = (project / "proofread/report.md").read_text(encoding="utf-8")
+            self.assertIn("Page 0001", report)
+            self.assertIn("Page 0002", report)
+            md1 = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            md2 = (project / "pages/0002/page.md").read_text(encoding="utf-8")
+            self.assertIn("因素——甲", md1)
+            self.assertIn("因素——乙", md2)
+
+    def test_from_ocr_restarts_after_bad_correction(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ocr = "# 理论基础\n\n因素—基础的讨论。\n"
+            project = make_project(tmp, [
+                {"items": [
+                    {"kind": "heading", "level": 1, "text": "理论基础"},
+                    {"kind": "para", "text": "因素—基础的讨论。"},
+                ]},
+            ])
+            (project / "pages/0001/page.ocr.md").write_text(ocr, encoding="utf-8")
+            (project / "pages/0001/page.md").write_text(
+                "# 假章节\n\n" + ocr, encoding="utf-8")
+            (project / "pages/0001/proofread.json").write_text(
+                json.dumps({"status": "done", "changed": True}), encoding="utf-8")
+            rc = self._run(project, extra=["--force"])
+            self.assertEqual(rc, 0)
+            snowballed = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertIn("假章节", snowballed)
+            rc = self._run(project, extra=["--force", "--from-ocr"])
+            self.assertEqual(rc, 0)
+            fixed = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertNotIn("假章节", fixed)
+            self.assertIn("因素——基础的", fixed)
+            self.assertIn("# 理论基础", fixed)
+
+    def test_dry_run_does_not_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [{"kind": "para", "text": "标记OCR_ERROR_FOO结束。因素—基础的。"}]},
+            ])
+            before = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            rc = self._run(project, extra=["--dry-run"])
+            self.assertEqual(rc, 0)
+            after = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            self.assertFalse((project / "pages/0001/proofread.json").exists())
+            report = (project / "proofread/report.md").read_text(encoding="utf-8")
+            results = json.loads((project / "proofread/results.json").read_text(encoding="utf-8"))
+            self.assertIn(results[0]["status"], {"would_change", "would_suggest"})
+
+    def test_failure_leaves_page_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [{"kind": "para", "text": "标记OCR_ERROR_FOO结束。"}]},
+            ])
+            before = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            rc = self._run(project, env={"FAKE_AGENT_BEHAVIOR": "fail"})
+            self.assertEqual(rc, 0)
+            after = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            self.assertFalse((project / "pages/0001/proofread.json").exists())
+            report = (project / "proofread/report.md").read_text(encoding="utf-8")
+            self.assertIn("failed", report)
+
+    def test_timeout_leaves_page_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [{"kind": "para", "text": "标记OCR_ERROR_FOO结束。"}]},
+            ])
+            before = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            rc = self._run(project, extra=["--timeout", "0.2"],
+                           env={"FAKE_AGENT_BEHAVIOR": "timeout", "FAKE_AGENT_SLEEP": "5"})
+            self.assertEqual(rc, 0)
+            after = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            report = (project / "proofread/report.md").read_text(encoding="utf-8")
+            self.assertIn("timeout", report)
+
+    def test_unsafe_correction_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = make_project(tmp, [
+                {"items": [
+                    {"kind": "para", "text": "配图如下。"},
+                    {"kind": "figure", "src": "fig_p0001_001.png", "caption": "图 1"},
+                ]},
+            ])
+            before = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            rc = self._run(project, env={"FAKE_AGENT_BEHAVIOR": "drop_figure"})
+            self.assertEqual(rc, 0)
+            after = (project / "pages/0001/page.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+            self.assertIn("dropped figure", (project / "proofread/report.md").read_text(encoding="utf-8"))
 
     def test_dry_run_does_not_write(self):
         with tempfile.TemporaryDirectory() as td:
@@ -390,8 +649,7 @@ class TestSampleOcrBuild(unittest.TestCase):
         self.assertEqual(norm(new_body), norm(old_body))
 
     def test_proofread_mock_on_sample_page3(self):
-        # restore a pre-punctuation dash if punct-normalize already fixed it;
-        # the known missing 等 is still present in basic-tier OCR.
+        # Known basic-tier miss 等 is an insertion/smudge guess: suggestion only.
         md = self.project / "pages/0003/page.md"
         text = md.read_text(encoding="utf-8")
         self.assertIn("趋势发展过一段之后", text)
@@ -401,8 +659,10 @@ class TestSampleOcrBuild(unittest.TestCase):
         ])
         self.assertEqual(rc, 0)
         after = md.read_text(encoding="utf-8")
-        self.assertIn("等趋势发展过一段之后", after)
-        # original OCR snapshot kept
+        self.assertNotIn("等趋势发展过一段之后", after)
+        report = (self.project / "proofread/report.md").read_text(encoding="utf-8")
+        self.assertIn("等", report)
+        self.assertIn("insert", report)
         ocr = (self.project / "pages/0003/page.ocr.md").read_text(encoding="utf-8")
         self.assertNotIn("等趋势发展过一段之后", ocr)
 

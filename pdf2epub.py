@@ -36,9 +36,10 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 DROP_TYPES = {"page_number", "header", "footer", "page_header", "page_footer",
@@ -59,27 +60,48 @@ PROOFREAD_JSON = "proofread.json"
 
 PROOFREAD_PROMPT = """You are proofreading OCR text from one scanned book page.
 
-Read the page image at this path (use your file-read tool):
+Read the page image once with the file-read tool (do not crop, do not call the
+shell, do not run Python/PIL, do not write files, do not fetch the web):
 {page_png}
 
-The current Markdown for this page is also at:
-{page_md}
-
-It is reproduced here:
+The current Markdown is at {page_md} and is reproduced here:
 ---BEGIN PAGE.MD---
 {page_text}
 ---END PAGE.MD---
 
 Rules:
-- Fix only confident OCR errors: wrong or missing characters, broken punctuation
-  such as a single "—" that should be "——".
+- Fix only confident OCR errors on characters that are clearly visible in the
+  scan: a wrong glyph, or broken punctuation such as a single "—" that should
+  be "——".
+- If a glyph is smudged, faint, or not actually visible, do NOT guess. Leave
+  the OCR text as-is. Do not insert characters to "fill a hole" (for example
+  do not invent 等 vs 当).
 - Do not rewrite, polish, paraphrase, or modernise the author's wording.
+  Do not change 大多→大多数, 期货商→交易商, or similar.
 - Keep the Markdown structure exactly (headings, paragraphs, :::figure blocks,
   blank lines, HTML footnote paragraphs).
-- Do not add commentary, analysis, or a preamble.
-- If there are no confident corrections, reply with exactly: NO_CHANGES
-- Otherwise reply with the complete corrected Markdown only (no code fences).
+- Do not add commentary, analysis, or a preamble in the answer.
+- One image read is enough; do not over-inspect.
+
+Reply with exactly one of:
+1. The token NO_CHANGES (and nothing else) if there are no confident
+   substitutions of visible glyphs / punctuation.
+2. The complete page Markdown wrapped in the markers below (no code fences,
+   no narration before or after the markers):
+
+---BEGIN PAGE.MD---
+...full page.md...
+---END PAGE.MD---
 """
+
+PAGE_BEGIN = "---BEGIN PAGE.MD---"
+PAGE_END = "---END PAGE.MD---"
+PAGE_CLI_CONFIG = {
+    "permissions": {
+        "allow": ["Read(*)"],
+        "deny": ["Shell(*)", "Write(*)", "WebFetch(*)", "Mcp(*:*)"],
+    }
+}
 
 
 def log(msg):
@@ -431,7 +453,7 @@ def load_project_pages(project: Path) -> tuple[dict, list[dict]]:
     book = json.loads(book_path.read_text(encoding="utf-8"))
     pages = []
     for pid in book.get("pages") or []:
-        page_dir = project / "pages" / pid
+        page_dir = (project / "pages" / pid).resolve()
         meta_path = page_dir / PAGE_META
         md_path = page_dir / PAGE_MD
         if not md_path.exists():
@@ -608,6 +630,11 @@ def run_epubcheck(out: Path) -> int:
 
 
 # --------------------------------------------------------------------- proofread (Cursor CLI)
+def now_local_iso() -> str:
+    """Timezone-aware local timestamp (offset in the string; not UTC)."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def find_agent_bin(explicit: str | None) -> str:
     if explicit:
         p = Path(explicit)
@@ -640,17 +667,111 @@ def _agent_argv(agent_bin: str) -> list[str]:
     return [str(path)]
 
 
+def ensure_page_cli_config(page_dir: Path) -> Path:
+    """Project-level Cursor CLI permissions: deny shell/write; allow reads.
+
+    https://cursor.com/docs/cli/reference/permissions
+    Workspace is the page directory, so this file is <page>/.cursor/cli.json.
+    """
+    cfg_dir = page_dir / ".cursor"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg_dir / "cli.json"
+    path.write_text(json.dumps(PAGE_CLI_CONFIG, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _assistant_text(event: dict) -> str:
+    msg = event.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") in (None, "text"):
+            parts.append(c.get("text") or "")
+        elif isinstance(c, str):
+            parts.append(c)
+    return "".join(parts)
+
+
+def parse_stream_json(stdout: str) -> dict:
+    """Parse `agent --output-format stream-json` NDJSON.
+
+    The concatenated `result` field joins *all* assistant text (narration
+    before/between tool calls included). The usable answer is the last
+    assistant message after the last tool call. Model id comes from the
+    system init event (what Auto actually picked).
+    Docs: https://cursor.com/docs/cli/reference/output-format
+    """
+    model = None
+    duration_ms = None
+    usage = None
+    is_error = False
+    error_text = None
+    concatenated = None
+    messages: list[str] = []
+    saw_result = False
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        typ = ev.get("type")
+        if typ == "system" and ev.get("subtype") == "init":
+            model = ev.get("model") or model
+        elif typ == "assistant":
+            # With --stream-partial-output, timestamp_ms marks deltas/duplicates.
+            # We do not pass that flag; skip those events if they appear.
+            if "timestamp_ms" in ev:
+                continue
+            text = _assistant_text(ev)
+            if text:
+                messages.append(text)
+        elif typ == "result":
+            saw_result = True
+            duration_ms = ev.get("duration_ms")
+            usage = ev.get("usage")
+            concatenated = ev.get("result")
+            is_error = bool(ev.get("is_error"))
+            if is_error:
+                error_text = ev.get("result")
+            model = ev.get("model") or model
+            if ev.get("subtype") and ev.get("subtype") != "success":
+                is_error = True
+                error_text = error_text or ev.get("result")
+    if is_error:
+        raise RuntimeError(f"Cursor CLI reported an error: {error_text!r}")
+    if not saw_result and not messages:
+        # maybe a single JSON object (older json format)
+        try:
+            data = json.loads(stdout.strip())
+        except json.JSONDecodeError as e:
+            raise ValueError("Cursor CLI produced no stream-json events") from e
+        if data.get("is_error"):
+            raise RuntimeError(f"Cursor CLI reported an error: {data.get('result')!r}")
+        return {
+            "text": unwrap_agent_markdown(str(data.get("result") or "")),
+            "model": data.get("model") or model,
+            "duration_ms": data.get("duration_ms"),
+            "usage": data.get("usage"),
+            "concatenated": data.get("result"),
+        }
+    text = messages[-1] if messages else (concatenated or "")
+    return {
+        "text": unwrap_agent_markdown(str(text)),
+        "model": model,
+        "duration_ms": duration_ms,
+        "usage": usage,
+        "concatenated": concatenated,
+    }
+
+
 def parse_agent_json(stdout: str) -> dict:
-    raw = stdout.strip()
-    if not raw:
-        raise ValueError("Cursor CLI produced empty stdout")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(raw[start:end + 1])
-        raise
+    """Back-compat helper used by tests; prefers stream-json, then a JSON object."""
+    return parse_stream_json(stdout)
 
 
 def unwrap_agent_markdown(text: str) -> str:
@@ -661,52 +782,195 @@ def unwrap_agent_markdown(text: str) -> str:
     return t.strip()
 
 
+def looks_like_no_changes(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t == "NO_CHANGES":
+        return True
+    if t.endswith("NO_CHANGES"):
+        return True
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    return bool(lines) and lines[-1] == "NO_CHANGES"
+
+
+def first_content_line(md: str) -> str:
+    for ln in md.splitlines():
+        if ln.strip():
+            return ln
+    return ""
+
+
+def strip_trailing_commentary(text: str, original: str) -> str:
+    blocks = re.split(r"\n\n+", text.strip("\n"))
+    orig = original.replace("\r\n", "\n")
+    while len(blocks) > 1:
+        last = blocks[-1].strip()
+        if last == "NO_CHANGES" or last.endswith("NO_CHANGES"):
+            blocks.pop()
+            continue
+        if last in orig:
+            break
+        if not re.search(r"[\u3400-\u9fff]", last) and re.search(r"[A-Za-z]{4,}", last):
+            blocks.pop()
+            continue
+        break
+    out = "\n\n".join(blocks)
+    return out + "\n" if text.endswith("\n") else out
+
+
+def starts_like_original(original: str, corrected: str) -> bool:
+    """True if `corrected` is page text, not a narrated preamble."""
+    first = first_content_line(original)
+    got = first_content_line(corrected)
+    if not first:
+        return True
+    if not got:
+        return False
+    if first.lstrip().startswith("#"):
+        return got.lstrip().startswith("#") and (
+            got == first or got.startswith(first) or first.startswith(got)
+        )
+    # English narration ("Comparing the OCR…") vs CJK/body OCR
+    if re.match(r"^[A-Za-z]{4,}\b", got) and not re.match(r"^[A-Za-z]{4,}\b", first):
+        return False
+    n = 0
+    for a, b in zip(first, got):
+        if a != b:
+            break
+        n += 1
+    return n >= min(2, len(first))
+
+
+def extract_page_markdown(raw: str, original: str) -> str | None:
+    """Pull page Markdown out of a (possibly narrated) final assistant message.
+
+    Returns 'NO_CHANGES', the extracted markdown, or None if it should be rejected.
+    """
+    t = unwrap_agent_markdown(raw)
+    if PAGE_BEGIN in t and PAGE_END in t:
+        t = t.split(PAGE_BEGIN, 1)[1].split(PAGE_END, 1)[0].strip("\n")
+        if t and not t.endswith("\n"):
+            t += "\n"
+    if looks_like_no_changes(t):
+        return "NO_CHANGES"
+    first = first_content_line(original)
+    if first:
+        idx = t.find(first)
+        if idx > 0:
+            t = t[idx:]
+        elif idx < 0 and not starts_like_original(original, t):
+            return None
+    t = strip_trailing_commentary(t, original)
+    if looks_like_no_changes(t):
+        return "NO_CHANGES"
+    if not t.strip():
+        return None
+    if not starts_like_original(original, t):
+        return None
+    if not t.endswith("\n"):
+        t += "\n"
+    return t
+
+
+def _is_punct_text(s: str) -> bool:
+    if not s:
+        return False
+    for ch in s:
+        if ch.isspace():
+            continue
+        if unicodedata.category(ch).startswith("P"):
+            continue
+        if ch in "—–―－-":
+            continue
+        return False
+    return any(not ch.isspace() for ch in s)
+
+
+def classify_and_apply(original: str, proposed: str) -> tuple[str, list[dict]]:
+    """Apply punctuation fixes; hold insertions and wording changes as suggestions.
+
+    Insertions (including smudge-fill guesses such as a missing 等) and any
+    non-punctuation substitution (大多→大多数, 期货商→交易商) are recorded but
+    not written to page.md.
+    """
+    sm = difflib.SequenceMatcher(a=original, b=proposed, autojunk=False)
+    out: list[str] = []
+    suggestions: list[dict] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        a, b = original[i1:i2], proposed[j1:j2]
+        if tag == "equal":
+            out.append(a)
+        elif tag == "replace":
+            if _is_punct_text(a) and _is_punct_text(b):
+                out.append(b)
+            else:
+                out.append(a)
+                suggestions.append({
+                    "type": "replace", "from": a, "to": b,
+                    "reason": "rewrite_or_uncertain_glyph", "at": i1,
+                })
+        elif tag == "insert":
+            if _is_punct_text(b):
+                out.append(b)
+            else:
+                suggestions.append({
+                    "type": "insert", "text": b,
+                    "reason": "insertion_or_smudge", "at": i1,
+                })
+        elif tag == "delete":
+            if _is_punct_text(a):
+                pass
+            else:
+                out.append(a)
+                suggestions.append({
+                    "type": "delete", "text": a,
+                    "reason": "content_deletion", "at": i1,
+                })
+    applied = "".join(out)
+    return applied, suggestions
+
+
 def run_cursor_agent(agent_bin: str, prompt: str, *, model: str | None, workspace: Path,
-                     timeout: float, api_key: str | None = None) -> str:
-    """Call `agent --print --output-format json` and return the result text.
+                     timeout: float, api_key: str | None = None) -> dict:
+    """Call `agent --print --output-format stream-json` and return parsed fields.
 
     Interface from https://cursor.com/docs/cli/headless and
     https://cursor.com/docs/cli/reference/parameters :
-      agent -p/--print --output-format json --model MODEL --trust --workspace DIR
-            --mode ask  PROMPT
-    Auth: CURSOR_API_KEY or --api-key (https://cursor.com/docs/cli/reference/authentication).
-    JSON shape: {type: result, subtype: success, result: "<text>", ...}
-      (https://cursor.com/docs/cli/reference/output-format)
-    Images: include file paths in the prompt; the agent reads them via tools
-      (https://cursor.com/docs/cli/headless#working-with-images).
+      agent --print --output-format stream-json --sandbox enabled --trust
+            --workspace ABS_DIR [--model MODEL] PROMPT
+    Auth: CURSOR_API_KEY in the child environment only (never --api-key on argv).
+    Images: include file paths in the prompt.
     """
+    ws = workspace.resolve()
+    ensure_page_cli_config(ws)
     cmd = _agent_argv(agent_bin) + [
         "--print",
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--sandbox", "enabled",
         "--trust",
-        "--mode", "ask",
-        "--workspace", str(workspace),
+        "--workspace", str(ws),
     ]
     if model:
         cmd.extend(["--model", model])
-    key = api_key or os.environ.get("CURSOR_API_KEY")
-    if key and "CURSOR_API_KEY" not in os.environ:
-        cmd.extend(["--api-key", key])
     cmd.append(prompt)
     env = os.environ.copy()
+    key = api_key or env.get("CURSOR_API_KEY")
     if api_key:
         env["CURSOR_API_KEY"] = api_key
+    elif key:
+        env["CURSOR_API_KEY"] = key
+    t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                       cwd=str(workspace), env=env)
+                       cwd=str(ws), env=env)
+    wall_ms = int((time.perf_counter() - t0) * 1000)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
         raise RuntimeError(f"Cursor CLI failed (exit {r.returncode}): {err[:2000]}")
-    data = parse_agent_json(r.stdout)
-    if data.get("is_error"):
-        raise RuntimeError(f"Cursor CLI reported an error: {data.get('result')!r}")
-    if data.get("type") not in (None, "result"):
-        # still accept if `result` is present
-        if "result" not in data:
-            raise RuntimeError(f"unexpected Cursor CLI JSON: {list(data)[:8]}")
-    result = data.get("result")
-    if result is None:
-        raise RuntimeError("Cursor CLI JSON missing 'result'")
-    return unwrap_agent_markdown(str(result))
+    parsed = parse_stream_json(r.stdout)
+    parsed["wall_ms"] = wall_ms
+    parsed["requested_model"] = model
+    return parsed
 
 
 def sha256_text(s: str) -> str:
@@ -723,6 +987,8 @@ def _correction_looks_safe(original: str, corrected: str, meta: dict) -> str | N
     """Return an error message if the model output should be rejected, else None."""
     if not corrected.strip():
         return "empty correction"
+    if not starts_like_original(original, corrected):
+        return "correction does not start like the original page"
     if len(original) > 80 and len(corrected) < max(20, int(0.4 * len(original))):
         return "correction much shorter than original OCR"
     for fig in meta.get("figures") or []:
@@ -736,17 +1002,38 @@ def _correction_looks_safe(original: str, corrected: str, meta: dict) -> str | N
     return None
 
 
+def _usage_summary(usage) -> str:
+    if not isinstance(usage, dict) or not usage:
+        return "-"
+    # CLI emits camelCase inputTokens/outputTokens; some builds use snake_case.
+    inp = usage.get("inputTokens", usage.get("input_tokens"))
+    out = usage.get("outputTokens", usage.get("output_tokens"))
+    bits = []
+    if inp is not None:
+        bits.append(f"in={inp}")
+    if out is not None:
+        bits.append(f"out={out}")
+    cache_r = usage.get("cacheReadTokens", usage.get("cache_read_tokens"))
+    if cache_r:
+        bits.append(f"cache_read={cache_r}")
+    return " ".join(bits) if bits else json.dumps(usage, ensure_ascii=False)
+
+
 def proofread_one_page(page: dict, *, agent_bin: str, model: str | None, timeout: float,
-                       dry_run: bool, force: bool, api_key: str | None) -> dict:
-    page_dir = Path(page["dir"])
+                       dry_run: bool, force: bool, api_key: str | None,
+                       from_ocr: bool = False) -> dict:
+    page_dir = Path(page["dir"]).resolve()
     md_path = page_dir / PAGE_MD
     png_path = page_dir / PAGE_PNG
     meta = page.get("meta") or {}
-    original = md_path.read_text(encoding="utf-8")
     ocr_path = page_dir / PAGE_OCR_MD
     ocr_text = ocr_path.read_text(encoding="utf-8") if ocr_path.exists() else None
+    on_disk = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    original = ocr_text if (from_ocr and ocr_text is not None) else on_disk
     status_path = page_dir / PROOFREAD_JSON
     pid = page.get("id") or f"{page['page']:04d}"
+    stats = {"model": None, "requested_model": model, "duration_ms": None,
+             "wall_ms": None, "usage": None, "time": now_local_iso()}
 
     if status_path.exists() and not force:
         try:
@@ -754,10 +1041,15 @@ def proofread_one_page(page: dict, *, agent_bin: str, model: str | None, timeout
         except json.JSONDecodeError:
             st = {}
         if st.get("status") == "done":
-            return {"page": pid, "status": "skipped", "reason": "already proofread"}
+            return {"page": pid, "status": "skipped", "reason": "already proofread", **stats}
 
     if not png_path.exists():
-        return {"page": pid, "status": "failed", "error": f"missing {png_path}"}
+        return {"page": pid, "status": "failed", "error": f"missing {png_path}", **stats}
+
+    if from_ocr and ocr_text is None:
+        return {"page": pid, "status": "failed", "error": f"missing {ocr_path}", **stats}
+    if from_ocr and ocr_text is not None and not dry_run:
+        md_path.write_text(ocr_text, encoding="utf-8")
 
     prompt = PROOFREAD_PROMPT.format(
         page_png=str(png_path.resolve()),
@@ -765,71 +1057,152 @@ def proofread_one_page(page: dict, *, agent_bin: str, model: str | None, timeout
         page_text=original,
     )
     try:
-        result = run_cursor_agent(agent_bin, prompt, model=model, workspace=page_dir,
-                                  timeout=timeout, api_key=api_key)
-    except subprocess.TimeoutExpired:
-        md_path.write_text(original, encoding="utf-8")
-        if ocr_text is not None:
-            ocr_path.write_text(ocr_text, encoding="utf-8")
-        return {"page": pid, "status": "failed", "error": f"timeout after {timeout}s"}
+        run = run_cursor_agent(agent_bin, prompt, model=model, workspace=page_dir,
+                               timeout=timeout, api_key=api_key)
+    except subprocess.TimeoutExpired as e:
+        if not dry_run:
+            md_path.write_text(on_disk if not from_ocr else original, encoding="utf-8")
+            if ocr_text is not None:
+                ocr_path.write_text(ocr_text, encoding="utf-8")
+        wall = int((e.timeout or timeout) * 1000)
+        return {"page": pid, "status": "failed", "error": f"timeout after {timeout}s",
+                **{**stats, "wall_ms": wall}}
     except Exception as e:
-        md_path.write_text(original, encoding="utf-8")
-        if ocr_text is not None:
-            ocr_path.write_text(ocr_text, encoding="utf-8")
-        return {"page": pid, "status": "failed", "error": str(e)}
+        if not dry_run:
+            md_path.write_text(on_disk if not from_ocr else original, encoding="utf-8")
+            if ocr_text is not None:
+                ocr_path.write_text(ocr_text, encoding="utf-8")
+        return {"page": pid, "status": "failed", "error": str(e), **stats}
+
+    stats.update({
+        "model": run.get("model") or model,
+        "duration_ms": run.get("duration_ms"),
+        "wall_ms": run.get("wall_ms"),
+        "usage": run.get("usage"),
+    })
 
     # Discard any in-place writes the agent may have made; we own the files.
-    md_path.write_text(original, encoding="utf-8")
+    md_path.write_text(on_disk, encoding="utf-8")
     if ocr_text is not None:
         ocr_path.write_text(ocr_text, encoding="utf-8")
 
-    if result == "NO_CHANGES" or result.replace("\r\n", "\n") == original.replace("\r\n", "\n"):
-        rec = {"status": "done", "changed": False, "model": model,
-               "time": datetime.now(timezone.utc).isoformat(),
-               "sha256": sha256_text(original)}
-        diff = ""
+    extracted = extract_page_markdown(run.get("text") or "", original)
+    if extracted is None:
+        return {"page": pid, "status": "failed",
+                "error": "could not extract page Markdown from agent output (narration?)",
+                **stats}
+
+    if extracted == "NO_CHANGES" or extracted.replace("\r\n", "\n") == original.replace("\r\n", "\n"):
+        rec = {"status": "done", "changed": False, **stats, "sha256": sha256_text(original)}
         if not dry_run:
             status_path.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
-        return {"page": pid, "status": "unchanged", "diff": diff, "dry_run": dry_run}
+        return {"page": pid, "status": "unchanged", "diff": "", "dry_run": dry_run, **stats}
 
-    err = _correction_looks_safe(original, result, meta)
+    err = _correction_looks_safe(original, extracted, meta)
     if err:
-        return {"page": pid, "status": "failed", "error": err}
+        return {"page": pid, "status": "failed", "error": err, **stats}
 
-    if not result.endswith("\n"):
-        result += "\n"
-    diff = unified_diff(original, result, f"pages/{pid}/{PAGE_MD}")
+    applied, suggestions = classify_and_apply(original, extracted)
+    if not applied.endswith("\n") and original.endswith("\n"):
+        applied += "\n"
+    applied_changed = applied.replace("\r\n", "\n") != original.replace("\r\n", "\n")
+    diff = unified_diff(original, applied, f"pages/{pid}/{PAGE_MD}") if applied_changed else ""
+    sug_diff = unified_diff(original, extracted, f"pages/{pid}/{PAGE_MD}") if suggestions else ""
+
     if dry_run:
-        return {"page": pid, "status": "would_change", "diff": diff, "dry_run": True}
+        status = "would_change" if applied_changed else ("would_suggest" if suggestions else "unchanged")
+        return {"page": pid, "status": status, "diff": diff, "suggestions": suggestions,
+                "suggestion_diff": sug_diff, "dry_run": True, **stats}
 
-    md_path.write_text(result, encoding="utf-8")
-    rec = {"status": "done", "changed": True, "model": model,
-           "time": datetime.now(timezone.utc).isoformat(),
-           "sha256": sha256_text(result), "sha256_before": sha256_text(original)}
+    to_write = applied if applied_changed else original
+    md_path.write_text(to_write, encoding="utf-8")
+    rec = {
+        "status": "done",
+        "changed": applied_changed,
+        "suggestions": suggestions,
+        "sha256": sha256_text(to_write),
+        "sha256_before": sha256_text(original),
+        **stats,
+    }
     status_path.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
-    return {"page": pid, "status": "changed", "diff": diff, "dry_run": False}
+    if applied_changed:
+        st = "changed"
+    elif suggestions:
+        st = "suggestions"
+    else:
+        st = "unchanged"
+    return {"page": pid, "status": st, "diff": diff, "suggestions": suggestions,
+            "suggestion_diff": sug_diff, "dry_run": False, **stats}
+
+
+def _load_existing_results(project: Path) -> list[dict]:
+    path = project / "proofread" / "results.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def merge_proofread_results(old: list[dict], new: list[dict]) -> list[dict]:
+    by_page: dict[str, dict] = {}
+    for r in old:
+        pid = str(r.get("page", ""))
+        if pid:
+            by_page[pid] = r
+    for r in new:
+        pid = str(r.get("page", ""))
+        if not pid:
+            continue
+        if r.get("status") == "skipped" and pid in by_page:
+            prev = dict(by_page[pid])
+            prev["skipped_this_run"] = True
+            by_page[pid] = prev
+        else:
+            by_page[pid] = r
+    return sorted(by_page.values(), key=lambda r: str(r.get("page", "")))
 
 
 def write_proofread_report(project: Path, results: list[dict], *, model: str | None,
-                           dry_run: bool) -> Path:
+                           dry_run: bool, merge_existing: bool = True) -> Path:
     out_dir = project / "proofread"
     diffs_dir = out_dir / "diffs"
     out_dir.mkdir(parents=True, exist_ok=True)
     diffs_dir.mkdir(parents=True, exist_ok=True)
-    counts = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "would_change": 0}
+    if merge_existing:
+        results = merge_proofread_results(_load_existing_results(project), results)
+    this_pages = {str(r.get("page")) for r in results}
+    counts: dict[str, int] = {}
     for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        st = r.get("status") or "unknown"
+        counts[st] = counts.get(st, 0) + 1
+        pid = str(r.get("page"))
         diff = r.get("diff") or ""
+        dpath = diffs_dir / f"{pid}.diff"
         if diff:
-            (diffs_dir / f"{r['page']}.diff").write_text(diff, encoding="utf-8")
+            dpath.write_text(diff, encoding="utf-8")
+        elif dpath.exists() and pid in this_pages and r.get("status") != "skipped":
+            # this run replaced a previous diff with no textual change
+            if r.get("status") in {"unchanged", "suggestions", "failed"}:
+                if r.get("status") != "suggestions":
+                    dpath.unlink()
+        sug = r.get("suggestion_diff") or ""
+        spath = diffs_dir / f"{pid}.suggestions.diff"
+        if sug:
+            spath.write_text(sug, encoding="utf-8")
+        elif spath.exists() and r.get("status") != "skipped":
+            spath.unlink()
     lines = [
         f"# Proofread report",
         f"",
-        f"- generated: {datetime.now(timezone.utc).isoformat()}",
-        f"- model: {model or '(Cursor CLI default)'}",
+        f"- generated (local): {now_local_iso()}",
+        f"- requested model: {model or '(Cursor CLI default / Auto)'}",
         f"- dry_run: {dry_run}",
         f"- pages: {len(results)}",
         f"- changed: {counts.get('changed', 0)}",
+        f"- suggestions (not auto-applied): {counts.get('suggestions', 0)}",
         f"- would_change: {counts.get('would_change', 0)}",
         f"- unchanged: {counts.get('unchanged', 0)}",
         f"- skipped (already proofread): {counts.get('skipped', 0)}",
@@ -838,15 +1211,44 @@ def write_proofread_report(project: Path, results: list[dict], *, model: str | N
     ]
     for r in results:
         lines.append(f"## Page {r['page']} — {r['status']}")
+        meta_bits = []
+        if r.get("model"):
+            meta_bits.append(f"model={r['model']}")
+        if r.get("wall_ms") is not None:
+            meta_bits.append(f"wall={r['wall_ms']}ms")
+        if r.get("duration_ms") is not None:
+            meta_bits.append(f"duration_ms={r['duration_ms']}")
+        if r.get("usage"):
+            meta_bits.append(f"usage {_usage_summary(r['usage'])}")
+        if r.get("time"):
+            meta_bits.append(f"at {r['time']}")
+        if meta_bits:
+            lines.append("\n" + ", ".join(meta_bits) + "\n")
         if r.get("error"):
             lines.append(f"\nError: {r['error']}\n")
         elif r.get("reason"):
             lines.append(f"\n{r['reason']}\n")
-        elif r.get("diff"):
-            lines.append("\n```diff")
+        if r.get("diff"):
+            lines.append("\nApplied diff:\n\n```diff")
             lines.append(r["diff"].rstrip("\n"))
             lines.append("```\n")
-        else:
+        if r.get("suggestions"):
+            lines.append("\nSuggestions (not auto-applied; needs human review):\n")
+            for s in r["suggestions"]:
+                if s.get("type") == "insert":
+                    lines.append(f"- insert {s.get('text')!r} ({s.get('reason')})")
+                elif s.get("type") == "replace":
+                    lines.append(f"- replace {s.get('from')!r} → {s.get('to')!r} ({s.get('reason')})")
+                elif s.get("type") == "delete":
+                    lines.append(f"- delete {s.get('text')!r} ({s.get('reason')})")
+                else:
+                    lines.append(f"- {s}")
+            lines.append("")
+            if r.get("suggestion_diff"):
+                lines.append("```diff")
+                lines.append(r["suggestion_diff"].rstrip("\n"))
+                lines.append("```\n")
+        if not r.get("diff") and not r.get("suggestions") and not r.get("error") and not r.get("reason"):
             lines.append("\nNo textual changes.\n")
     report = out_dir / "report.md"
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -858,13 +1260,14 @@ def write_proofread_report(project: Path, results: list[dict], *, model: str | N
 # --------------------------------------------------------------------- stages
 def resolve_project(args, pdf: Path | None = None) -> Path:
     if getattr(args, "project", None):
-        return Path(args.project)
-    out = getattr(args, "output", None)
-    if out:
-        return Path(out).with_name(Path(out).stem + "_work")
-    if pdf is not None:
-        return Path(pdf).with_name(Path(pdf).stem + "_work")
-    raise SystemExit("specify --project (editable project directory)")
+        p = Path(args.project)
+    elif getattr(args, "output", None):
+        p = Path(args.output).with_name(Path(args.output).stem + "_work")
+    elif pdf is not None:
+        p = Path(pdf).with_name(Path(pdf).stem + "_work")
+    else:
+        raise SystemExit("specify --project (editable project directory)")
+    return p.expanduser().resolve()
 
 
 def cmd_ocr(args) -> Path:
@@ -935,10 +1338,11 @@ def cmd_proofread(args) -> Path:
     book, pages = load_project_pages(project)
     agent_bin = find_agent_bin(getattr(args, "agent_bin", None))
     model = getattr(args, "model", None) or None
-    timeout = float(getattr(args, "timeout", 180) or 180)
+    timeout = float(getattr(args, "timeout", 300) or 300)
     jobs = max(1, int(getattr(args, "jobs", 1) or 1))
     dry_run = bool(getattr(args, "dry_run", False))
     force = bool(getattr(args, "force", False))
+    from_ocr = bool(getattr(args, "from_ocr", False))
     api_key = getattr(args, "api_key", None)
     only = set(args.only_page) if getattr(args, "only_page", None) else None
     if only:
@@ -946,27 +1350,33 @@ def cmd_proofread(args) -> Path:
         if not pages:
             raise SystemExit(f"no pages matched --only-page {sorted(only)}")
     log(f"proofread {len(pages)} page(s) via {agent_bin} "
-        f"(model={model or 'default'}, jobs={jobs}, timeout={timeout}s, dry_run={dry_run})")
+        f"(model={model or 'default'}, jobs={jobs}, timeout={timeout}s, "
+        f"dry_run={dry_run}, from_ocr={from_ocr})")
+    kw = dict(agent_bin=agent_bin, model=model, timeout=timeout, dry_run=dry_run,
+              force=force, api_key=api_key, from_ocr=from_ocr)
     results: list[dict] = []
     if jobs == 1:
         for p in pages:
             log(f"proofreading page {p['id']} ...")
-            r = proofread_one_page(p, agent_bin=agent_bin, model=model, timeout=timeout,
-                                   dry_run=dry_run, force=force, api_key=api_key)
-            log(f"page {r['page']}: {r['status']}" + (f" ({r['error']})" if r.get("error") else ""))
+            r = proofread_one_page(p, **kw)
+            log(f"page {r['page']}: {r['status']}"
+                + (f" ({r['error']})" if r.get("error") else "")
+                + f" model={r.get('model') or '-'} wall={r.get('wall_ms')}ms "
+                  f"duration_ms={r.get('duration_ms')} usage={_usage_summary(r.get('usage'))}")
             results.append(r)
     else:
         lock = threading.Lock()
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            futs = {ex.submit(proofread_one_page, p, agent_bin=agent_bin, model=model,
-                              timeout=timeout, dry_run=dry_run, force=force,
-                              api_key=api_key): p for p in pages}
+            futs = {ex.submit(proofread_one_page, p, **kw): p for p in pages}
             for fut in as_completed(futs):
                 r = fut.result()
                 with lock:
                     results.append(r)
                     log(f"page {r['page']}: {r['status']}"
-                        + (f" ({r['error']})" if r.get("error") else ""))
+                        + (f" ({r['error']})" if r.get("error") else "")
+                        + f" model={r.get('model') or '-'} wall={r.get('wall_ms')}ms "
+                          f"duration_ms={r.get('duration_ms')} "
+                          f"usage={_usage_summary(r.get('usage'))}")
         results.sort(key=lambda r: r["page"])
     report = write_proofread_report(project, results, model=model, dry_run=dry_run)
     nfail = sum(1 for r in results if r["status"] == "failed")
@@ -1061,14 +1471,17 @@ def _add_proofread_args(p):
     _add_project_arg(p)
     p.add_argument("--model", help="Cursor CLI --model (see `agent --list-models` / `agent models`)")
     p.add_argument("--jobs", type=int, default=1, help="concurrent Cursor CLI processes (default 1)")
-    p.add_argument("--timeout", type=float, default=180, help="per-page Cursor CLI timeout in seconds")
+    p.add_argument("--timeout", type=float, default=300, help="per-page Cursor CLI timeout in seconds (default 300)")
     p.add_argument("--dry-run", action="store_true",
                    help="run the model and write a report, but do not modify page.md")
     p.add_argument("--force", action="store_true", help="re-proofread pages already marked done")
+    p.add_argument("--from-ocr", action="store_true", dest="from_ocr",
+                   help="restore page.md from page.ocr.md before proofreading "
+                        "(use with --force to redo a bad correction from the original OCR)")
     p.add_argument("--agent-bin", help="Cursor CLI binary (default: agent on PATH, or $PDF2EPUB_AGENT_BIN)")
-    p.add_argument("--api-key", help="passed as --api-key; otherwise CURSOR_API_KEY is used")
+    p.add_argument("--api-key", help="set CURSOR_API_KEY for the child process (never passed on the command line)")
     p.add_argument("--only-page", type=int, action="append",
-                   help="restrict to this 1-based page number (repeatable)")
+                   help="restrict to this 1-based page number (repeatable); report is merged")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1092,9 +1505,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="ocr + build only (same as the legacy one-shot invocation)")
     p_all.add_argument("--model", help="Cursor CLI --model")
     p_all.add_argument("--jobs", type=int, default=1)
-    p_all.add_argument("--timeout", type=float, default=180)
+    p_all.add_argument("--timeout", type=float, default=300)
     p_all.add_argument("--dry-run", action="store_true")
     p_all.add_argument("--force", action="store_true")
+    p_all.add_argument("--from-ocr", action="store_true", dest="from_ocr")
     p_all.add_argument("--agent-bin")
     p_all.add_argument("--api-key")
     p_all.add_argument("--only-page", type=int, action="append")

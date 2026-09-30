@@ -44,15 +44,28 @@ agent models          # or: agent --list-models
 pdf2epub invokes the documented non-interactive interface:
 
 ```text
-agent --print --output-format json --trust --mode ask --workspace <page-dir>
-      [--model MODEL] [--api-key KEY] "<prompt>"
+agent --print --output-format stream-json --sandbox enabled --trust
+      --workspace <absolute-page-dir> [--model MODEL] "<prompt>"
 ```
 
-`--print` (`-p`) is headless print mode. `--output-format json` returns a single
-object whose `result` field is the assistant text. `--mode ask` is read-only;
-pdf2epub applies accepted corrections itself. Page images are passed as file
-paths in the prompt ([Working with images](https://cursor.com/docs/cli/headless.md)).
-Auth is `CURSOR_API_KEY` or `--api-key`. The binary name is `agent`.
+`--print` (`-p`) is headless print mode. `--output-format stream-json` is used
+instead of `json` because the JSON `result` field concatenates **all** assistant
+text, including narration before and between tool calls. pdf2epub keeps only the
+last assistant message after the last tool call, then extracts Markdown between
+`---BEGIN PAGE.MD---` / `---END PAGE.MD---` markers (or treats a reply that
+**ends** in `NO_CHANGES` as unchanged).
+
+`--mode ask` is **not** a sandbox: the agent can still run shell commands and
+write files. pdf2epub therefore passes `--sandbox enabled` and writes a per-page
+`.cursor/cli.json` that **denies** `Shell(*)`, `Write(*)`, `WebFetch(*)`, and
+MCP tools, while allowing `Read(*)` so the page image can be opened. pdf2epub
+applies accepted corrections itself.
+
+`--workspace` is always an absolute path (a relative `--project` is resolved
+first). Auth is `CURSOR_API_KEY` in the environment; `--api-key` on pdf2epub
+is copied into that env and is **never** placed on the child command line.
+The binary name is `agent`. Page images are passed as file paths in the prompt
+([Working with images](https://cursor.com/docs/cli/headless.md)).
 
 ## Usage
 
@@ -61,7 +74,8 @@ Auth is `CURSOR_API_KEY` or `--api-key`. The binary name is `agent`.
 python pdf2epub.py ocr book.pdf --project book_work --title "书名" --author "作者"
 
 # 2. Optional: proofread each page with the Cursor CLI (resumable)
-python pdf2epub.py proofread --project book_work --model gpt-5 --jobs 2
+python pdf2epub.py proofread --project book_work --model claude-sonnet-5-thinking-high --jobs 2
+# other ids from `agent models`, e.g. gpt-5.6-sol-high, composer-2.5
 
 # 3. Build EPUB purely from the project directory (hand edits honoured)
 python pdf2epub.py build --project book_work -o out/book.epub --epubcheck
@@ -83,14 +97,16 @@ Useful flags:
 --epubcheck             run epubcheck if installed
 
 proofread:
-  --model NAME          Cursor CLI --model
+  --model NAME          Cursor CLI --model (`agent models`; e.g. claude-sonnet-5-thinking-high,
+                        gpt-5.6-sol-high, composer-2.5). Auto records the resolved id.
   --jobs N              concurrent agent processes (default 1)
-  --timeout SEC         per-page timeout (default 180); on timeout the page is left unchanged
+  --timeout SEC         per-page timeout (default 300); on timeout the page is left unchanged
   --dry-run             call the model and write a report, do not modify page.md
-  --force               re-proofread pages already marked done
+  --force               re-proofread pages already marked done (uses current page.md)
+  --from-ocr            restore page.md from page.ocr.md first (with --force, redo a bad correction)
   --agent-bin PATH      default: `agent` on PATH, ~/.local/bin/agent, or $PDF2EPUB_AGENT_BIN
-  --api-key KEY         otherwise CURSOR_API_KEY
-  --only-page N         repeatable; proofread a subset of pages
+  --api-key KEY         set CURSOR_API_KEY for the child (not passed on argv)
+  --only-page N         repeatable; proofread a subset of pages (report/results are merged)
 ```
 
 `--reuse-json` still needs the PDF (pages are re-rendered). MinerU is not called.
@@ -146,15 +162,22 @@ fragment with the previous page (and still applies the original fallback:
 if the previous paragraph has no terminal punctuation, the next page’s leading
 paragraph is joined). Chapter splits follow `#` headings, same as before.
 
-Proofread writes corrections into `page.md`, leaves `page.ocr.md` intact, and
-appends a reviewable report. Already-proofread pages are skipped unless
-`--force`. Failures and timeouts leave `page.md` unchanged and are retried on
-the next run. `--dry-run` still calls the model and writes `proofread/report.md`
-but does not mark pages done or edit `page.md`.
+Proofread writes punctuation-level corrections into `page.md`, leaves
+`page.ocr.md` intact, and appends a reviewable report (per-page diff, wall time,
+CLI `duration_ms`, token `usage`, and the model Auto actually picked). Timestamps
+are local time with an offset. Already-proofread pages are skipped unless
+`--force`. `--force` re-sends the **current** `page.md` (a bad correction would
+snowball); `--force --from-ocr` restores `page.ocr.md` first. Failures and
+timeouts leave `page.md` unchanged and are retried on the next run. `--dry-run`
+still calls the model and writes `proofread/report.md` but does not mark pages
+done or edit `page.md`. `--only-page` merges into the existing report instead of
+replacing it.
 
-The proofreader is instructed to fix only confident OCR errors (wrong or
-missing characters, a single `—` that should be `——`) and **not** to rewrite,
-polish, or modernise the author’s wording.
+The proofreader is instructed to fix only confident substitutions of **visible**
+glyphs and broken punctuation (`—` → `——`), not to rewrite or modernise the
+author, and not to guess smudged/missing characters (e.g. 等 vs 当). Insertions
+and other non-punctuation edits are **suggestions** in the report for human
+review; they are not auto-applied. One image read is enough; do not over-inspect.
 
 ## Notes / hurdles
 * MinerU 4.x is no longer the old `magic-pdf` CLI; its `mineru parse` CLI goes through a
@@ -182,5 +205,5 @@ polish, or modernise the author’s wording.
 python3 -m unittest tests.test_pdf2epub
 ```
 Proofread tests use `tests/fake_cursor_agent.py`, a stand-in for `agent` that
-speaks the documented JSON print-mode interface. They do not require a Cursor
-login.
+speaks the documented stream-json print-mode interface (including narration
+around tool calls). They do not require a Cursor login.
