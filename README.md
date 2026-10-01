@@ -19,12 +19,47 @@ python pdf2epub.py book.pdf -o out/book.epub --title "书名" --author "作者" 
 #   --tier basic      (default) ONNX pipeline, ~2–3 s/page on 8 CPU cores
 #   --tier standard   adds MinerU2.5 VLM via llama.cpp; ~35–40 s/page on CPU, slightly better
 #   --reuse-json      skip OCR and rebuild the EPUB from the cached MinerU JSON
+#   --from-json FILE  same rebuild from a MinerU JSON path (PDF / page images optional)
+#   --chapter-regex RE   override the default Chinese chapter-title pattern
+#   --toc-file FILE   user TOC (one title per line; indent = nesting; optional page number)
 #   --no-punct-normalize   keep OCR punctuation as-is
 ```
 Intermediates go to `<out>_work/` (or `--workdir`):
 `pages/` 300-DPI renders, `images/` cropped figures, `layout/` pages with layout boxes drawn
 (red = dropped header/footer/page no., blue = text, orange = heading, green = figure,
 purple = caption), `mineru_<tier>.json` raw layout/OCR, `items.json` cleaned stream, `book.md`.
+
+### Heading / chapter detection
+Chapters are **pattern-first**, not “tallest box = h1”. The default regex matches Chinese
+front/back matter and numbered divisions, with Chinese or Arabic numerals:
+
+`第X章` / `第X篇` / `第X部分` / `第X卷`, `附录X`, `前言`, `序`/`序言`, `译者的话`,
+`目录`, `致谢`, `后记`, `索引`, `全书大会串`, …
+
+Box height is only a **secondary** signal, and it uses **per-line** height so a wrapped
+section title is not ranked above a one-line chapter title. Recurring sub-heads such as
+`引言` that MinerU labelled as body text are promoted; sentence fragments (ending in
+`。，；、`, too long, or continuing the previous paragraph) and short labels sitting on a
+figure are demoted. The EPUB TOC is 2–3 levels: chapter files with sections nested under them.
+
+`--chapter-regex` replaces that default (e.g. `'^Chapter\\s+\\d+'`). `--toc-file` overrides
+levels for titles it can match, in document order:
+
+```
+前言
+第一章 技术分析的理论基础
+  引言
+  理论基础
+附录一
+索引
+```
+
+`--from-json mineru_basic.json -o out/book.epub` rebuilds structure from OCR JSON alone
+(no PDF, no re-OCR). Missing page PNGs skip figure crops but keep captions and reading order.
+`--reuse-json` still reads `mineru_<tier>.json` from the work dir when a PDF is given.
+
+Tests: `python -m unittest discover -s tests`. Synthetic fixtures only are in-repo; a real
+MinerU dump can be pointed at with `MINERU_BASIC_JSON` (do not commit scanned books).
 
 ## Notes / hurdles
 * MinerU 4.x is no longer the old `magic-pdf` CLI; its `mineru parse` CLI goes through a
@@ -43,6 +78,7 @@ purple = caption), `mineru_<tier>.json` raw layout/OCR, `items.json` cleaned str
    bbox + 0.8 % padding), attach captions.
 4. Cleaning – drop `header/footer/page_number`, merge `continues_prev` blocks (+ fallback:
    first text on a page joins previous paragraph if it lacks terminal punctuation),
-   CJK punctuation normalisation, heading levels from glyph height (largest size gap → h1).
-5. `build_epub` – one XHTML per h1 chapter, h2 in nested TOC, figures with `<figcaption>`, CSS
+   CJK punctuation normalisation, chapter titles from a Chinese regex (size / per-line
+   height only to rank remaining h2/h3).
+5. `build_epub` – one XHTML per h1 chapter, h2/h3 nested in the TOC, figures with `<figcaption>`, CSS
    with 2em indent, nav + NCX, `zh-CN` metadata; optional epubcheck.
