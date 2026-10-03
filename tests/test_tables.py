@@ -1,10 +1,8 @@
-"""Synthetic tests for MinerU table handling (prose vs real HTML, heading order)."""
+"""Synthetic tests for MinerU table handling (prose vs image crop, heading order)."""
 from __future__ import annotations
 
-import importlib.util
 import sys
 import unittest
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,8 +27,6 @@ def kinds_and_texts(items):
             out.append(("heading", it["text"]))
         elif it["kind"] == "para":
             out.append(("para", it["text"]))
-        elif it["kind"] == "table":
-            out.append(("table", it.get("html") or ""))
         else:
             out.append((it["kind"], it.get("src") or it.get("caption") or ""))
     return out
@@ -84,25 +80,6 @@ class SplitAndClassifyTests(unittest.TestCase):
         long = "技术分析的基本前提是市场行为包容消化一切。" * 8
         eight = [[long] for _ in range(8)]
         self.assertTrue(p.is_prose_table(eight, n_cols=1))
-
-
-class SanitizeTests(unittest.TestCase):
-    def test_sanitize_escapes_and_closes(self):
-        raw = "<table><tr><td>a&b</td><td>价 格</td></tr></table>"
-        xhtml = p.sanitize_table_html(raw)
-        self.assertIn("<table>", xhtml)
-        self.assertIn("</table>", xhtml)
-        self.assertIn("a&amp;b", xhtml)
-        self.assertNotIn("a&b", xhtml)
-        wrapped = f'<div>{xhtml}</div>'
-        ET.fromstring(wrapped)
-
-    def test_sanitize_keeps_colspan(self):
-        raw = '<TABLE><TR><TH colspan="2">合计</TH></TR><TR><TD>1</TD><TD>2</TD></TR></TABLE>'
-        xhtml = p.sanitize_table_html(raw)
-        self.assertIn("colspan=", xhtml)
-        self.assertIn("<th", xhtml)
-        ET.fromstring(f"<div>{xhtml}</div>")
 
 
 class ProseTableDocumentTests(unittest.TestCase):
@@ -175,7 +152,7 @@ class ProseTableDocumentTests(unittest.TestCase):
 
 
 class RealTableDocumentTests(unittest.TestCase):
-    def test_real_table_emits_sanitised_html(self):
+    def test_real_table_stays_cropped_figure(self):
         raw = (
             "<table><tr><th>品种</th><th>价格</th></tr>"
             "<tr><td>大豆</td><td>12.5</td></tr>"
@@ -186,138 +163,16 @@ class RealTableDocumentTests(unittest.TestCase):
             table_block(raw, [0.15, 0.30, 0.85, 0.55], caption="表 1.1 价格"),
             para("表后正文。", 500),
         ]])
-        tabs = [it for it in items if it["kind"] == "table"]
-        self.assertEqual(len(tabs), 1)
-        self.assertIn("<table>", tabs[0]["html"])
-        self.assertIn("大豆", tabs[0]["html"])
-        self.assertIn("表 1.1", tabs[0]["caption"])
-        body = p.render_xhtml({"title": "第一章 示例", "items": items}, [])
-        self.assertIn('<figure class="table">', body)
-        self.assertIn("<table>", body)
-        self.assertNotIn("<img", body)
-        ET.fromstring(f'<div xmlns="http://www.w3.org/1999/xhtml">{body}</div>')
-
-    def test_tables_html_forces_html_even_for_prose(self):
-        raw = "<table><tr><td>" + ("叙述体句子。另一句也很长，用来超过阈值。" * 6) + "</td></tr></table>"
-        items = build([[table_block(raw, [0.2, 0.1, 0.8, 0.7])]], table_mode="html")
-        self.assertTrue(any(it["kind"] == "table" for it in items))
-        self.assertFalse(any(it["kind"] == "para" and "叙述体" in it["text"] for it in items))
-
-
-DENSE_HTML = (
-    "<table><tr><th>品种</th><th>价格</th><th>涨跌</th></tr>"
-    "<tr><td>大豆</td><td>12.50</td><td>+0.20</td></tr>"
-    "<tr><td>玉米</td><td>8.00</td><td>-0.10</td></tr>"
-    "<tr><td>小麦</td><td>9.20</td><td>+0.05</td></tr></table>"
-)
-SPARSE_HTML = (
-    "<table>"
-    "<tr><td>A</td><td></td><td></td></tr>"
-    "<tr><td></td><td>B</td><td></td></tr>"
-    "<tr><td></td><td></td><td>C</td></tr>"
-    "<tr><td></td><td></td><td></td></tr>"
-    "</table>"
-)
-SCRAMBLED_HTML = (
-    "<table>"
-    "<tr><td>1.</td><td>--</td><td>3/</td><td></td></tr>"
-    "<tr><td>12</td><td>4</td></tr>"
-    "<tr><td>.</td><td>1.</td><td>--</td><td>9</td><td></td><td>x</td></tr>"
-    "<tr><td>2.</td></tr>"
-    "</table>"
-)
-CHART_HTML = (
-    "<table>"
-    "<tr><td></td><td>X</td><td></td><td>O</td><td></td></tr>"
-    "<tr><td>X</td><td></td><td>O</td><td></td><td>X</td></tr>"
-    "<tr><td></td><td>O</td><td></td><td>X</td><td></td></tr>"
-    "<tr><td>O</td><td></td><td>X</td><td></td><td></td></tr>"
-    "</table>"
-)
-
-
-def _decide(html, caption=None, mode="auto", page_blocks=None, bbox=None, **kw):
-    payload = {"html": html, "caption": [caption] if caption else [], "body": bbox or [0.2, 0.2, 0.8, 0.7]}
-    return p.classify_table_decision(payload, mode, page_blocks=page_blocks,
-                                     table_bbox=bbox or payload["body"], **kw)
-
-
-class TableQualityGateTests(unittest.TestCase):
-    def test_dense_good_table_stays_html(self):
-        info = _decide(DENSE_HTML, caption="表 9.1 价格")
-        self.assertEqual(info["decision"], "html", info)
-        self.assertTrue(info["scores"]["dense"])
-        self.assertGreaterEqual(info["scores"]["score"], p.DEFAULT_TABLE_MIN_QUALITY)
-        self.assertLessEqual(info["scores"]["empty"], 0.05)
-        self.assertLessEqual(info["scores"]["noise"], 0.25)
-
-    def test_sparse_table_falls_back_to_image(self):
-        info = _decide(SPARSE_HTML)
-        self.assertEqual(info["decision"], "image", info)
-        self.assertGreater(info["scores"]["empty"], p.TABLE_EMPTY_CELL_RATIO)
-        self.assertIn("empty", info["reason"])
-
-    def test_scrambled_numeric_table_falls_back_to_image(self):
-        info = _decide(SCRAMBLED_HTML)
-        self.assertEqual(info["decision"], "image", info)
-        self.assertTrue(
-            info["scores"]["cols"] > p.TABLE_COL_INCONSISTENT_RATIO
-            or info["scores"]["noise"] > p.TABLE_NOISE_CELL_RATIO,
-            info,
-        )
-
-    def test_captioned_chart_falls_back_to_image(self):
-        info = _decide(CHART_HTML, caption="图3.10 点数图")
-        self.assertEqual(info["decision"], "image", info)
-        self.assertTrue(info["scores"]["caption"])
-        self.assertTrue(
-            info["scores"]["xo"] > p.TABLE_XO_CELL_RATIO
-            or info["scores"]["empty"] > p.TABLE_EMPTY_CELL_RATIO,
-            info,
-        )
-
-    def test_figure_caption_does_not_reject_dense_grid(self):
-        # p466-style: 图 caption on a clean table must stay HTML.
-        info = _decide(DENSE_HTML, caption="图15.15 对照")
-        self.assertEqual(info["decision"], "html", info)
-        self.assertTrue(info["scores"]["caption"])
-        self.assertTrue(info["scores"]["dense"])
-        self.assertGreaterEqual(info["scores"]["score"], p.DEFAULT_TABLE_MIN_QUALITY)
-
-    def test_overlap_with_figure_region_penalises_sparse_grid(self):
-        bbox = [0.2, 0.2, 0.8, 0.7]
-        blocks = [
-            {"type": "image", "bbox": [0.15, 0.15, 0.85, 0.75], "content": ""},
-        ]
-        info = _decide(SPARSE_HTML, page_blocks=blocks, bbox=bbox)
-        self.assertEqual(info["decision"], "image", info)
-        self.assertGreaterEqual(info["scores"]["overlap"], p.TABLE_FIGURE_OVERLAP)
-
-    def test_tables_html_forces_html_despite_quality(self):
-        info = _decide(SPARSE_HTML, mode="html")
-        self.assertEqual(info["decision"], "html")
-        self.assertEqual(info["reason"], "forced-html")
-
-    def test_min_quality_knob_rejects_borderline_score(self):
-        info_lo = _decide(DENSE_HTML, caption="图15.15 对照", min_quality=0.0)
-        info_hi = _decide(DENSE_HTML, caption="图15.15 对照", min_quality=0.99)
-        self.assertEqual(info_lo["decision"], "html")
-        # dense+caption score is high but not perfect
-        self.assertLess(info_hi["scores"]["score"], 0.99)
-        self.assertEqual(info_hi["decision"], "image")
-
-    def test_build_sparse_table_emits_figure(self):
-        items = build([[table_block(SPARSE_HTML, [0.2, 0.2, 0.8, 0.7])]])
-        self.assertTrue(any(it["kind"] == "figure" for it in items))
+        figs = [it for it in items if it["kind"] == "figure"]
+        self.assertEqual(len(figs), 1)
+        self.assertEqual(figs[0]["type"], "table")
+        self.assertIn("表 1.1", figs[0]["caption"])
         self.assertFalse(any(it["kind"] == "table" for it in items))
-
-    def test_constants_match_documented_thresholds(self):
-        self.assertAlmostEqual(p.TABLE_EMPTY_CELL_RATIO, 0.40)
-        self.assertAlmostEqual(p.TABLE_NOISE_CELL_RATIO, 0.50)
-        self.assertAlmostEqual(p.TABLE_XO_CELL_RATIO, 0.25)
-        self.assertAlmostEqual(p.TABLE_COL_INCONSISTENT_RATIO, 0.40)
-        self.assertAlmostEqual(p.TABLE_SPAN_IRREGULAR_RATIO, 0.30)
-        self.assertAlmostEqual(p.DEFAULT_TABLE_MIN_QUALITY, 0.55)
+        self.assertFalse(any(it["kind"] == "para" and "大豆" in it.get("text", "") for it in items))
+        body = p.render_xhtml({"title": "第一章 示例", "items": items}, [])
+        self.assertIn("<img", body)
+        self.assertNotIn("<table>", body)
+        self.assertIn("表 1.1", body)
 
 
 class InterleaveUnitTests(unittest.TestCase):
@@ -333,57 +188,6 @@ class InterleaveUnitTests(unittest.TestCase):
         out = p.interleave_margin_headings(items)
         seq = [it["text"] for it in out]
         self.assertEqual(seq, ["A", "B", "总结", "C", "结语", "D"])
-
-
-class EpubXmlTests(unittest.TestCase):
-    def test_chapter_with_table_is_xml(self):
-        items = [
-            {"kind": "heading", "text": "第一章 示例", "level": 1},
-            {"kind": "para", "text": "正文一段。", "cls": None},
-            {"kind": "table", "html": "<table><tr><td>格</td></tr></table>",
-             "caption": "", "src": None, "show_image": False},
-        ]
-        chapters = p.split_chapters(items, "书")
-        body = p.render_xhtml(chapters[0], [])
-        ET.fromstring(
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
-            f"{body}</body></html>"
-        )
-
-
-class MarkdownTests(unittest.TestCase):
-    def test_to_markdown_includes_table_html(self):
-        md = p.to_markdown([
-            {"kind": "table", "html": "<table><tr><td>x</td></tr></table>", "caption": "表 1"},
-        ])
-        self.assertIn("<table>", md)
-        self.assertIn("表 1", md)
-
-
-@unittest.skipUnless(importlib.util.find_spec("ebooklib"), "ebooklib not installed")
-class EpubBuildTests(unittest.TestCase):
-    def test_build_epub_with_html_table(self):
-        import tempfile
-        import zipfile
-        from pathlib import Path
-
-        items = [
-            {"kind": "heading", "text": "第一章 示例", "level": 1, "page": 1},
-            {"kind": "para", "text": "正文一段。", "cls": None},
-            {"kind": "table", "html": "<table><tr><td>格</td></tr></table>",
-             "caption": "", "src": None, "show_image": False},
-        ]
-        chapters = p.split_chapters(items, "书")
-        with tempfile.TemporaryDirectory() as td:
-            img = Path(td) / "images"
-            img.mkdir()
-            out = Path(td) / "t.epub"
-            p.build_epub(chapters, out, "书", "", "zh-CN", img, None)
-            with zipfile.ZipFile(out) as z:
-                xhtml = z.read("EPUB/chap_001.xhtml").decode("utf-8")
-            self.assertIn("<table>", xhtml)
-            ET.fromstring(xhtml)
 
 
 if __name__ == "__main__":

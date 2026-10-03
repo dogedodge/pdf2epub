@@ -6,8 +6,8 @@ Pipeline
   2. Layout analysis + OCR with MinerU (runs locally; "basic" tier = ONNX
      PP-DocLayoutV2 + PP-OCRv6, "standard" tier adds the MinerU2.5 1.2B VLM).
   3. Crop illustrations / charts from the page renders using the layout
-     boxes. Tables: misclassified prose → paragraphs; real tables → HTML
-     (optional image crop).
+     boxes. Tables: misclassified prose → paragraphs; real tables stay
+     cropped images with their captions.
   4. Clean text: drop headers/footers/page numbers, merge paragraphs split
      across pages, normalise CJK punctuation, detect chapters/headings.
   5. Build an EPUB 3 (ebooklib): one XHTML per chapter, figures in place,
@@ -17,8 +17,8 @@ Usage
   python pdf2epub.py input.pdf -o out.epub [--tier basic|standard]
          [--title T] [--author A] [--dpi 300] [--workdir DIR]
          [--reuse-json] [--from-json mineru.json] [--chapter-regex RE]
-         [--toc-file toc.txt] [--tables auto|html|image] [--table-images]
-         [--table-min-quality 0.55] [--no-punct-normalize] [--epubcheck]
+         [--toc-file toc.txt] [--tables auto|image]
+         [--no-punct-normalize] [--epubcheck]
 """
 from __future__ import annotations
 
@@ -64,44 +64,16 @@ PLATE_LABEL_RE = re.compile(r"模式\s*[\d,，、—\-–]+")
 CONT_PREFIXES = ("例如", "但是", "因此", "所以", "于是", "其中", "此外", "不过",
                  "然而", "其实", "当然", "总之", "可见")
 _FW_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
-TABLE_MODES = ("auto", "html", "image")
+TABLE_MODES = ("auto", "image")
 # MinerU sometimes wraps a whole text column as a 1–2 column "table".
 _PROSE_AVG_CHARS = 80
 _PROSE_LONG_CELL = 200
 _PARA_SPLIT_RE = re.compile(
     r"(?<=[。！？…][”’」』])\s+|(?<=[。！？…])\s+"
 )
-_TABLE_TAGS = frozenset({
-    "table", "thead", "tbody", "tfoot", "tr", "td", "th",
-    "caption", "colgroup", "col", "br",
-})
-_TABLE_ATTRS = {
-    "td": ("colspan", "rowspan", "scope"),
-    "th": ("colspan", "rowspan", "scope"),
-    "col": ("span",),
-    "colgroup": ("span",),
-}
-# Quality gate: unreliable OCR HTML falls back to the cropped scan.
-TABLE_EMPTY_CELL_RATIO = 0.40          # hard fail if more than this share is empty
-TABLE_NOISE_CELL_RATIO = 0.50          # hard fail: fragmentary digits / symbols
-TABLE_XO_CELL_RATIO = 0.25             # hard fail: point-and-figure X/O marks
-TABLE_COL_INCONSISTENT_RATIO = 0.40    # hard fail: row widths disagree
-TABLE_SPAN_IRREGULAR_RATIO = 0.30      # hard fail: body cells with rowspan/colspan
-TABLE_FIGURE_OVERLAP = 0.30            # overlap with an image/chart box
-DEFAULT_TABLE_MIN_QUALITY = 0.55       # combined score cutoff (--table-min-quality)
-FIGURE_CAPTION_RE = re.compile(
-    r"^(?:图|圖)\s*[\d０-９]|^(?:Figure|Fig\.?)\b",
-    re.I,
-)
-_COMPLETE_NUM_RE = re.compile(
-    r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?$"
-)
-_XO_MARK_RE = re.compile(r"^[XOxo○●〇x]+$")
-_EMPTY_CELL_RE = re.compile(r"^[\s.\-–—_·•*]+$")
 # Line-wrap after 。 is indistinguishable from a paragraph break in table HTML;
 # do not split when the next span is a mid-paragraph "for example".
 _PARA_NO_BREAK_PREFIXES = ("举例来说", "比如说", "也就是说", "换言之", "亦即")
-FIGURE_REGION_TYPES = frozenset({"image", "chart", "figure", "seal"})
 
 
 def log(msg):
@@ -616,166 +588,76 @@ def refine_headings(items: list[dict], chapter_re: re.Pattern | None = None,
 
 
 # --------------------------------------------------------------------- tables
-class _TableWalker(HTMLParser):
-    """Collect cell texts and rebuild a small sanitised XHTML table."""
+class _TableCells(HTMLParser):
+    """Collect cell texts from MinerU table_body HTML (for prose detection)."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.rows: list[list[str]] = []
-        self.cell_meta: list[list[dict]] = []
         self.n_cols = 0
         self._row: list[str] | None = None
-        self._row_meta: list[dict] | None = None
         self._cell: list[str] | None = None
         self._cell_span = 1
-        self._cell_rowspan = 1
         self._row_cols = 0
-        self._parts: list[str] = []
-        self._stack: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         tag = (tag or "").lower()
         if tag == "tr":
             self._row = []
-            self._row_meta = []
             self._row_cols = 0
         elif tag in ("td", "th"):
             self._cell = []
             self._cell_span = 1
-            self._cell_rowspan = 1
             for k, v in attrs:
                 if k.lower() == "colspan":
                     try:
                         self._cell_span = max(1, int(v))
                     except (TypeError, ValueError):
                         self._cell_span = 1
-                elif k.lower() == "rowspan":
-                    try:
-                        self._cell_rowspan = max(1, int(v))
-                    except (TypeError, ValueError):
-                        self._cell_rowspan = 1
         elif tag == "br" and self._cell is not None:
             self._cell.append("\n")
-        if tag not in _TABLE_TAGS:
-            return
-        if tag == "br":
-            self._parts.append("<br/>")
-            return
-        allowed = _TABLE_ATTRS.get(tag, ())
-        adict = {str(k).lower(): v for k, v in attrs}
-        attr_s = ""
-        for k in allowed:
-            if k not in adict or adict[k] is None:
-                continue
-            v = re.sub(r"[^0-9A-Za-z_\-]", "", str(adict[k]))
-            if v:
-                attr_s += f' {k}="{html.escape(v, quote=True)}"'
-        if tag == "col":
-            self._parts.append(f"<col{attr_s}/>")
-            return
-        self._parts.append(f"<{tag}{attr_s}>")
-        self._stack.append(tag)
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
-        if (tag or "").lower() not in ("br", "col"):
+        if (tag or "").lower() != "br":
             self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
         tag = (tag or "").lower()
         if tag in ("td", "th") and self._cell is not None:
-            text = "".join(self._cell)
             if self._row is not None:
-                self._row.append(text)
-                if self._row_meta is not None:
-                    self._row_meta.append({
-                        "text": text, "colspan": self._cell_span, "rowspan": self._cell_rowspan,
-                    })
+                self._row.append("".join(self._cell))
                 self._row_cols += self._cell_span
                 self.n_cols = max(self.n_cols, self._row_cols)
             self._cell = None
         elif tag == "tr" and self._row is not None:
             self.rows.append(self._row)
-            self.cell_meta.append(self._row_meta or [])
             self.n_cols = max(self.n_cols, self._row_cols, len(self._row))
             self._row = None
-            self._row_meta = None
-        if tag in _TABLE_TAGS and tag not in ("br", "col"):
-            if self._stack and self._stack[-1] == tag:
-                self._stack.pop()
-                self._parts.append(f"</{tag}>")
 
     def handle_data(self, data):
         if self._cell is not None:
             self._cell.append(data)
-        if self._stack:
-            self._parts.append(html.escape(data))
 
     def finish(self):
         if self._cell is not None:
-            self.handle_endtag("td" if not (self._stack and self._stack[-1] == "th") else "th")
+            self.handle_endtag("td")
         if self._row is not None:
             self.handle_endtag("tr")
-        while self._stack:
-            self._parts.append(f"</{self._stack.pop()}>")
 
 
-def _walk_table(raw: str | None) -> _TableWalker | None:
+def parse_table_html(raw: str | None) -> tuple[list[list[str]], int]:
+    """Return (rows of cell texts, n_cols) from MinerU table HTML."""
     if not raw or "<table" not in raw.lower():
-        return None
-    walker = _TableWalker()
+        return [], 0
+    walker = _TableCells()
     try:
         walker.feed(raw)
         walker.close()
         walker.finish()
     except Exception:
-        return None
-    return walker
-
-
-def parse_table_html(raw: str | None) -> tuple[list[list[str]], int, str]:
-    """Return (rows of cell texts, n_cols, sanitised XHTML)."""
-    walker = _walk_table(raw)
-    if walker is None:
-        return [], 0, ""
-    xhtml = "".join(walker._parts).strip()
-    if "<table" not in xhtml.lower():
-        xhtml = ""
-    return walker.rows, walker.n_cols, xhtml
-
-
-def parse_table_analysis(raw: str | None) -> dict:
-    """Rows, column count, sanitised XHTML, and per-cell span metadata."""
-    walker = _walk_table(raw)
-    if walker is None:
-        return {"rows": [], "n_cols": 0, "xhtml": "", "cell_meta": []}
-    xhtml = "".join(walker._parts).strip()
-    if "<table" not in xhtml.lower():
-        xhtml = ""
-    return {
-        "rows": walker.rows, "n_cols": walker.n_cols, "xhtml": xhtml,
-        "cell_meta": walker.cell_meta,
-    }
-
-
-def table_html_from_rows(rows: list[list[str]]) -> str:
-    out = ["<table>"]
-    for row in rows:
-        out.append("<tr>")
-        for cell in row:
-            out.append(f"<td>{html.escape(cell)}</td>")
-        out.append("</tr>")
-    out.append("</table>")
-    return "".join(out)
-
-
-def sanitize_table_html(raw: str | None) -> str:
-    rows, _, xhtml = parse_table_html(raw)
-    if xhtml:
-        return xhtml
-    if rows:
-        return table_html_from_rows(rows)
-    return ""
+        return [], 0
+    return walker.rows, walker.n_cols
 
 
 def cell_plain_len(text: str) -> int:
@@ -802,213 +684,6 @@ def is_prose_table(rows: list[list[str]], n_cols: int) -> bool:
     if avg >= _PROSE_LONG_CELL and sent >= 1:
         return True
     return False
-
-
-def is_figure_style_caption(text: str) -> bool:
-    """True for 图 / 圖 / Figure captions (not 表, which is a real table)."""
-    t = (text or "").strip()
-    if not t:
-        return False
-    return bool(FIGURE_CAPTION_RE.match(t))
-
-
-def cell_is_empty(text: str) -> bool:
-    t = (text or "").strip()
-    return (not t) or bool(_EMPTY_CELL_RE.fullmatch(t))
-
-
-def cell_is_noise(text: str) -> bool:
-    """Fragmentary digits/symbols, not a complete number or a real word."""
-    t = re.sub(r"\s+", "", text or "")
-    if not t or cell_is_empty(t):
-        return False
-    if _COMPLETE_NUM_RE.fullmatch(t):
-        return False
-    if _XO_MARK_RE.fullmatch(t):
-        return True
-    if re.search(r"[\u3400-\u9fffA-Za-z]{2,}", t):
-        return False
-    if len(t) <= 2 and not t.isalnum():
-        return True
-    if len(t) <= 2 and t.isdigit():
-        return False
-    if len(t) <= 3 and re.fullmatch(r"[.\-–—_/\\|~`'\"]+", t):
-        return True
-    if len(t) <= 4 and re.search(r"\d", t) and re.search(r"[^\d.,%\-+\u2212]", t):
-        return True
-    if t.endswith(".") and t[:-1].isdigit() and len(t) <= 4:
-        return True
-    return False
-
-
-def cell_is_xo(text: str) -> bool:
-    t = re.sub(r"\s+", "", text or "")
-    return bool(t and _XO_MARK_RE.fullmatch(t))
-
-
-def _row_width_inconsistency(widths: list[int]) -> float:
-    if len(widths) < 2:
-        return 0.0
-    ordered = sorted(widths)
-    med = ordered[len(ordered) // 2]
-    if med <= 0:
-        return 1.0
-    return sum(1 for w in widths if w != med) / len(widths)
-
-
-def bbox_overlap_ratio(a, b) -> float:
-    """Intersection over area of *a* (0 if either box is missing)."""
-    if not a or not b or len(a) < 4 or len(b) < 4:
-        return 0.0
-    ix0, iy0 = max(float(a[0]), float(b[0])), max(float(a[1]), float(b[1]))
-    ix1, iy1 = min(float(a[2]), float(b[2])), min(float(a[3]), float(b[3]))
-    if ix1 <= ix0 or iy1 <= iy0:
-        return 0.0
-    area = (float(a[2]) - float(a[0])) * (float(a[3]) - float(a[1]))
-    if area <= 0:
-        return 0.0
-    return ((ix1 - ix0) * (iy1 - iy0)) / area
-
-
-def _bboxes_near(a, b, gap: float = 0.08) -> bool:
-    if bbox_overlap_ratio(a, b) > 0:
-        return True
-    if not a or not b or len(a) < 4 or len(b) < 4:
-        return False
-    horiz = not (float(b[2]) < float(a[0]) or float(b[0]) > float(a[2]))
-    if not horiz:
-        return False
-    if float(b[3]) <= float(a[1]) + 0.02 and float(a[1]) - float(b[3]) <= gap:
-        return True
-    if float(a[3]) <= float(b[1]) + 0.02 and float(b[1]) - float(a[3]) <= gap:
-        return True
-    return False
-
-
-def collect_figure_signals(table_bbox, page_blocks, own_captions) -> tuple[bool, float]:
-    """Figure-style caption (own or nearby) and max overlap with an image/chart."""
-    captions = [c for c in (own_captions or []) if c]
-    overlap = 0.0
-    for b in page_blocks or []:
-        if not isinstance(b, dict):
-            continue
-        bb = b.get("bbox")
-        bt = b.get("type") or ""
-        if bt in FIGURE_REGION_TYPES and bb:
-            overlap = max(overlap, bbox_overlap_ratio(table_bbox, bb))
-        texts: list[str] = []
-        if bt in TITLE_TYPES or bt in ("text", "paragraph_title") or bt.endswith("caption"):
-            texts.append(block_text(b.get("content")))
-        if isinstance(b.get("content"), list):
-            for sub in b["content"]:
-                if not isinstance(sub, dict):
-                    continue
-                st = str(sub.get("type") or "")
-                if st.endswith("_caption"):
-                    cap = block_text(sub.get("content"))
-                    texts.append(cap)
-                    if sub.get("bbox") and table_bbox and _bboxes_near(table_bbox, sub["bbox"]):
-                        captions.append(cap)
-        for t in texts:
-            if not is_figure_style_caption(t):
-                continue
-            if bb and table_bbox and _bboxes_near(table_bbox, bb):
-                captions.append(t)
-            elif not bb and not table_bbox:
-                captions.append(t)
-    fig_cap = any(is_figure_style_caption(t) for t in captions)
-    return fig_cap, overlap
-
-
-def table_quality(rows: list[list[str]], cell_meta: list[list[dict]] | None,
-                  captions: list[str] | None = None, table_bbox=None,
-                  page_blocks=None, min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> dict:
-    """Score recognised table HTML; ok=False means fall back to the image crop."""
-    meta = cell_meta or [[{"text": c, "colspan": 1, "rowspan": 1} for c in row] for row in rows]
-    cells = [c for row in rows for c in row]
-    n = len(cells)
-    fig_cap, overlap = collect_figure_signals(table_bbox, page_blocks, captions)
-    if n == 0:
-        return {
-            "ok": False, "reason": "no-cells",
-            "empty": 1.0, "noise": 1.0, "xo": 0.0, "cols": 1.0, "span": 0.0,
-            "caption": fig_cap, "overlap": overlap, "score": 0.0, "dense": False,
-        }
-    empty_n = sum(1 for c in cells if cell_is_empty(c))
-    empty_ratio = empty_n / n
-    nonempty = [c for c in cells if not cell_is_empty(c)]
-    noise_n = sum(1 for c in nonempty if cell_is_noise(c))
-    noise_ratio = noise_n / len(nonempty) if nonempty else 1.0
-    xo_n = sum(1 for c in nonempty if cell_is_xo(c))
-    xo_ratio = xo_n / len(nonempty) if nonempty else 0.0
-    if meta and any(meta):
-        widths = [sum(int(m.get("colspan") or 1) for m in row) for row in meta]
-    else:
-        widths = [len(r) for r in rows]
-    col_inconsist = _row_width_inconsistency(widths)
-    body = [m for i, row in enumerate(meta) for m in row if i > 0]
-    span_n = sum(1 for m in body if int(m.get("colspan") or 1) > 1 or int(m.get("rowspan") or 1) > 1)
-    span_ratio = span_n / len(body) if body else 0.0
-    dense = (
-        empty_ratio <= 0.20 and noise_ratio <= 0.25 and col_inconsist <= 0.20
-        and xo_ratio <= 0.10 and n >= 4
-    )
-    reasons: list[str] = []
-    if empty_ratio > TABLE_EMPTY_CELL_RATIO:
-        reasons.append("empty")
-    if noise_ratio > TABLE_NOISE_CELL_RATIO:
-        reasons.append("noise")
-    if xo_ratio > TABLE_XO_CELL_RATIO:
-        reasons.append("chart-marks")
-    if col_inconsist > TABLE_COL_INCONSISTENT_RATIO:
-        reasons.append("scrambled-cols")
-    if span_ratio > TABLE_SPAN_IRREGULAR_RATIO:
-        reasons.append("irregular-spans")
-    score = 1.0
-    score -= 0.9 * max(0.0, empty_ratio - 0.10) / 0.50
-    score -= 0.9 * max(0.0, noise_ratio - 0.15) / 0.55
-    score -= 0.8 * col_inconsist
-    score -= 0.6 * span_ratio
-    score -= 0.8 * xo_ratio
-    if fig_cap:
-        score -= 0.08 if dense else 0.28
-    if overlap >= TABLE_FIGURE_OVERLAP:
-        score -= 0.08 if dense else 0.25
-    score = max(0.0, min(1.0, score))
-    if reasons:
-        reason = "+".join(reasons)
-        if fig_cap:
-            reason = "figure-caption+" + reason
-        elif overlap >= TABLE_FIGURE_OVERLAP:
-            reason = "figure-overlap+" + reason
-        ok = False
-    elif score < min_quality:
-        ok = False
-        reason = "figure-caption+low-score" if fig_cap else "low-score"
-    else:
-        ok = True
-        reason = "quality-ok"
-    return {
-        "ok": ok, "reason": reason, "empty": empty_ratio, "noise": noise_ratio,
-        "xo": xo_ratio, "cols": col_inconsist, "span": span_ratio,
-        "caption": fig_cap, "overlap": overlap, "score": score, "dense": dense,
-    }
-
-
-def format_table_decision_log(page: int, info: dict) -> str:
-    s = info.get("scores") or info
-    if info.get("decision") == "prose":
-        return (
-            f"page {page}: table → prose ({info.get('reason')}; "
-            f"cells={s.get('cells', '?')} cols={s.get('cols', '?')} avg={s.get('avg', 0):.0f})"
-        )
-    return (
-        f"page {page}: table → {info.get('decision')} ({info.get('reason')}; "
-        f"empty={s.get('empty', 0):.2f} noise={s.get('noise', 0):.2f} "
-        f"xo={s.get('xo', 0):.2f} cols={s.get('cols', 0):.2f} "
-        f"span={s.get('span', 0):.2f} cap={int(bool(s.get('caption')))} "
-        f"ov={s.get('overlap', 0):.2f} score={s.get('score', 0):.2f})"
-    )
 
 
 def split_ocr_paragraphs(text: str) -> list[str]:
@@ -1086,7 +761,7 @@ def prose_table_to_paras(rows: list[list[str]], table_bbox, page: int,
 
 def extract_table_payload(block: dict) -> dict:
     body = list(block.get("bbox") or [0, 0, 1, 1])
-    caption, foot, table_html, plain = [], [], None, []
+    caption, foot, raw_html, plain = [], [], None, []
     if isinstance(block.get("content"), list):
         for sub in block["content"]:
             if not isinstance(sub, dict):
@@ -1097,65 +772,55 @@ def extract_table_payload(block: dict) -> dict:
                     body = list(sub["bbox"])
                 c = sub.get("content")
                 if isinstance(c, str) and "<table" in c.lower():
-                    table_html = c
+                    raw_html = c
                 elif isinstance(c, str) and c.strip():
                     plain.append(c)
                 else:
                     raw = block_text(c)
                     if raw and "<table" in raw.lower():
-                        table_html = raw
+                        raw_html = raw
                     elif raw.strip():
                         plain.append(raw)
             elif st.endswith("_caption"):
                 caption.append(block_text(sub.get("content")))
             elif st.endswith("_footnote"):
                 foot.append(block_text(sub.get("content")))
-    if table_html is None and plain:
-        table_html = table_html_from_rows([[p] for p in plain])
-    return {"body": body, "caption": caption, "footnote": foot, "html": table_html}
+    rows, n_cols = parse_table_html(raw_html)
+    if not rows and plain:
+        rows, n_cols = [[p] for p in plain], 1
+    return {
+        "body": body, "caption": caption, "footnote": foot,
+        "rows": rows, "n_cols": n_cols,
+    }
 
 
-def classify_table_decision(payload: dict, table_mode: str,
-                            page_blocks=None, table_bbox=None,
-                            min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> dict:
-    """Decide prose / html / image. Auto: prose, then quality gate, then HTML."""
+def classify_table(payload: dict, table_mode: str = "auto") -> dict:
+    """Decide prose vs cropped image. Auto converts only mislabelled body text."""
     mode = table_mode if table_mode in TABLE_MODES else "auto"
-    try:
-        min_quality = float(min_quality)
-    except (TypeError, ValueError):
-        min_quality = DEFAULT_TABLE_MIN_QUALITY
-    min_quality = max(0.0, min(1.0, min_quality))
-    raw = payload.get("html")
-    analysis = parse_table_analysis(raw)
-    rows, n_cols = analysis["rows"], analysis["n_cols"]
-    q = table_quality(
-        rows, analysis.get("cell_meta"),
-        captions=payload.get("caption") or [],
-        table_bbox=table_bbox or payload.get("body"),
-        page_blocks=page_blocks,
-        min_quality=min_quality,
-    )
-    scores = {k: q[k] for k in (
-        "empty", "noise", "xo", "cols", "span", "caption", "overlap", "score", "dense",
-    )}
-    if mode == "image" or not raw:
-        return {"decision": "image", "reason": "mode=image" if mode == "image" else "no-html",
-                "scores": scores, "analysis": analysis}
-    if mode == "html":
-        return {"decision": "html", "reason": "forced-html", "scores": scores, "analysis": analysis}
+    rows = payload.get("rows") or []
+    n_cols = payload.get("n_cols") or 0
+    cells = [c for row in rows for c in row]
+    total = sum(cell_plain_len(c) for c in cells) if cells else 0
+    avg = total / len(cells) if cells else 0
+    scores = {"cells": len(cells), "cols": n_cols, "avg": avg}
+    if mode == "image":
+        return {"decision": "image", "reason": "mode=image", "scores": scores, "rows": rows}
     if is_prose_table(rows, n_cols):
-        cells = [c for row in rows for c in row]
-        total = sum(cell_plain_len(c) for c in cells) if cells else 0
-        avg = total / len(cells) if cells else 0
         return {
             "decision": "prose",
             "reason": "long sentence-like cells",
-            "scores": {"cells": len(cells), "cols": n_cols, "avg": avg},
-            "analysis": analysis,
+            "scores": scores,
+            "rows": rows,
         }
-    if not q["ok"]:
-        return {"decision": "image", "reason": q["reason"], "scores": scores, "analysis": analysis}
-    return {"decision": "html", "reason": q["reason"], "scores": scores, "analysis": analysis}
+    return {"decision": "image", "reason": "real-table", "scores": scores, "rows": rows}
+
+
+def format_table_decision_log(page: int, info: dict) -> str:
+    s = info.get("scores") or {}
+    return (
+        f"page {page}: table → {info.get('decision')} ({info.get('reason')}; "
+        f"cells={s.get('cells', '?')} cols={s.get('cols', '?')} avg={s.get('avg', 0):.0f})"
+    )
 
 
 def _is_margin_heading(it: dict) -> bool:
@@ -1194,7 +859,7 @@ def interleave_margin_headings(items: list[dict]) -> list[dict]:
             hy = 0.0
         idx = len(body)
         for i, it in enumerate(body):
-            if it.get("kind") in ("figure", "table"):
+            if it.get("kind") == "figure":
                 continue
             mid = _item_mid_y(it)
             if mid is not None and mid > hy:
@@ -1250,9 +915,7 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
                    chapter_re: re.Pattern | None = None,
                    toc_entries: list[dict] | None = None,
                    chapter_max_len: int | None = 48,
-                   table_mode: str = "auto",
-                   table_images: bool = False,
-                   table_min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> list[dict]:
+                   table_mode: str = "auto") -> list[dict]:
     """Build the linear document stream. Figure crops are skipped when PNGs are missing."""
     if page_info is None:
         page_info = page_info_from_mineru(mj)
@@ -1291,15 +954,10 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
                 continue
             if t == "table":
                 payload = extract_table_payload(b)
-                info = classify_table_decision(
-                    payload, table_mode, page_blocks=p.get("blocks"),
-                    table_bbox=b.get("bbox"), min_quality=table_min_quality,
-                )
+                info = classify_table(payload, table_mode)
                 log(format_table_decision_log(pidx + 1, info))
-                analysis = info.get("analysis") or parse_table_analysis(payload.get("html"))
-                rows, xhtml = analysis.get("rows") or [], analysis.get("xhtml") or ""
-                decision = info["decision"]
-                if table_mode != "image" and decision == "prose" and rows:
+                rows = info.get("rows") or []
+                if info["decision"] == "prose" and rows:
                     exploded = prose_table_to_paras(
                         rows, payload.get("body") or b["bbox"], pidx + 1,
                         punct, height_pt, width_pt,
@@ -1318,29 +976,6 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
                                 continue
                         items.append(it)
                     continue
-                if table_mode != "image" and decision == "html":
-                    table_xhtml = xhtml or sanitize_table_html(payload.get("html"))
-                    if table_xhtml:
-                        fig_no += 1
-                        name = f"fig_p{pidx + 1:04d}_{fig_no:03d}.png"
-                        box = None
-                        if table_images and page_img is not None and img_dir is not None and W and H:
-                            bx0, by0, bx1, by1 = payload.get("body") or b["bbox"]
-                            box = (max(0, int((bx0 - pad) * W)), max(0, int((by0 - pad) * H)),
-                                   min(W, int((bx1 + pad) * W)), min(H, int((by1 + pad) * H)))
-                            page_img.crop(box).save(img_dir / name, optimize=True)
-                        cap = " ".join(normalize_punct(c) if punct else c
-                                       for c in payload.get("caption") or [] if c)
-                        items.append({
-                            "kind": "table", "type": t, "html": table_xhtml,
-                            "src": name if box else None,
-                            "show_image": bool(box),
-                            "path": str((img_dir / name) if img_dir and box else name),
-                            "caption": cap,
-                            "footnote": " ".join(payload.get("footnote") or []),
-                            "page": pidx + 1, "crop_px": box, "bbox": list(b["bbox"]),
-                        })
-                        continue
             if t in FLOAT_TYPES:
                 fig_no += 1
                 body = b["bbox"]
@@ -1416,13 +1051,6 @@ p.footnote { font-size: 0.85em; text-indent: 0; }
 figure { margin: 1em 0; text-align: center; page-break-inside: avoid; }
 figure img { max-width: 100%; height: auto; }
 figcaption { font-size: 0.9em; text-indent: 0; text-align: left; margin-top: 0.4em; }
-figure.table { text-align: left; }
-figure.table table { width: 100%; border-collapse: collapse; font-size: 0.92em; margin: 0.2em 0; }
-figure.table th, figure.table td {
-  border: 1px solid #666; padding: 0.25em 0.45em; vertical-align: top; text-align: left;
-}
-figure.table th { font-weight: bold; }
-figure.table img { margin-bottom: 0.4em; }
 """
 
 
@@ -1457,16 +1085,6 @@ def render_xhtml(ch: dict, sec_ids: list) -> str:
                 cls = "noindent"
             c = f' class="{cls}"' if cls else ""
             out.append(f"<p{c}>{html.escape(it['text'])}</p>")
-        elif it["kind"] == "table":
-            cap = f"<figcaption>{html.escape(it['caption'])}</figcaption>" if it.get("caption") else ""
-            bits = []
-            if it.get("src") and it.get("show_image"):
-                alt = html.escape((it.get("caption") or "")[:80] or "table", quote=True)
-                bits.append(f'<img src="images/{it["src"]}" alt="{alt}"/>')
-            bits.append(it["html"])
-            if cap:
-                bits.append(cap)
-            out.append(f'<figure class="table">{"".join(bits)}</figure>')
         elif it["kind"] == "figure":
             alt = html.escape(it["caption"][:80] or "illustration", quote=True)
             cap = f"<figcaption>{html.escape(it['caption'])}</figcaption>" if it["caption"] else ""
@@ -1540,9 +1158,6 @@ def to_markdown(items) -> str:
             md.append("#" * int(it.get("level") or 2) + " " + it["text"])
         elif it["kind"] == "para":
             md.append(it["text"])
-        elif it["kind"] == "table":
-            cap = it.get("caption") or ""
-            md.append((f"**{cap}**\n\n" if cap else "") + (it.get("html") or ""))
         else:
             md.append(f"![{it['caption']}](images/{it['src']})\n\n*{it['caption']}*")
     return "\n\n".join(md) + "\n"
@@ -1617,14 +1232,8 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--toc-file", type=Path, dest="toc_file",
                     help="user TOC: one title per line, indent for nesting, optional page number")
     ap.add_argument("--tables", choices=TABLE_MODES, default="auto",
-                    help="table handling: auto = prose→paragraphs, real tables→HTML; "
-                         "html = always emit recognised HTML; image = crop only (legacy)")
-    ap.add_argument("--table-images", action="store_true", dest="table_images",
-                    help="also embed the cropped scan of real tables next to the HTML")
-    ap.add_argument("--table-min-quality", type=float, default=DEFAULT_TABLE_MIN_QUALITY,
-                    dest="table_min_quality",
-                    help="auto mode: emit HTML only when the quality score is at least this "
-                         f"(default {DEFAULT_TABLE_MIN_QUALITY}); lower keeps more HTML")
+                    help="table handling: auto = mislabelled prose→paragraphs, "
+                         "real tables stay cropped images; image = crop every table")
     ap.add_argument("--no-punct-normalize", action="store_true")
     ap.add_argument("--epubcheck", action="store_true", help="run epubcheck if available")
     a = ap.parse_args(argv)
@@ -1677,8 +1286,7 @@ def main(argv: list[str] | None = None):
     items = build_document(
         mj, page_info, work / "images", punct=not a.no_punct_normalize,
         chapter_re=chapter_re, toc_entries=toc_entries, chapter_max_len=chapter_max_len,
-        table_mode=a.tables, table_images=a.table_images,
-        table_min_quality=a.table_min_quality,
+        table_mode=a.tables,
     )
     try:
         draw_overlays(mj, page_info, work / "layout")
@@ -1697,8 +1305,7 @@ def main(argv: list[str] | None = None):
     build_epub(chapters, out, title, a.author, a.lang, work / "images", a.cover)
     timings["build"] = time.time() - t
     nfig = sum(1 for i in items if i["kind"] == "figure")
-    ntab = sum(1 for i in items if i["kind"] == "table")
-    log(f"wrote {out}: {len(chapters)} chapters, {nfig} figures, {ntab} HTML tables, "
+    log(f"wrote {out}: {len(chapters)} chapters, {nfig} figures, "
         f"{sum(len(i['text']) for i in items if i['kind'] == 'para')} body chars")
     log("timings: " + ", ".join(f"{k}={v:.1f}s" for k, v in timings.items()))
 
