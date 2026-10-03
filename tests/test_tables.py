@@ -52,6 +52,16 @@ class SplitAndClassifyTests(unittest.TestCase):
         self.assertIn("空格", cleaned[0])
         self.assertNotIn("空 格", cleaned[0])
 
+    def test_split_keeps_for_example_in_same_paragraph(self):
+        raw = (
+            "在结束讨论之前还要指出某些重要区别。 举例来说，多数情况并非如此。"
+            " 下一段才是新的段落并且足够长。"
+        )
+        parts = p.split_ocr_paragraphs(raw)
+        self.assertEqual(len(parts), 2, parts)
+        self.assertIn("举例来说", parts[0])
+        self.assertTrue(parts[1].startswith("下一段"))
+
     def test_prose_vs_real_classification(self):
         prose_rows = [[
             "这是一段很长的说明文字。它看起来像正文而不是表格单元格。"
@@ -192,6 +202,122 @@ class RealTableDocumentTests(unittest.TestCase):
         items = build([[table_block(raw, [0.2, 0.1, 0.8, 0.7])]], table_mode="html")
         self.assertTrue(any(it["kind"] == "table" for it in items))
         self.assertFalse(any(it["kind"] == "para" and "叙述体" in it["text"] for it in items))
+
+
+DENSE_HTML = (
+    "<table><tr><th>品种</th><th>价格</th><th>涨跌</th></tr>"
+    "<tr><td>大豆</td><td>12.50</td><td>+0.20</td></tr>"
+    "<tr><td>玉米</td><td>8.00</td><td>-0.10</td></tr>"
+    "<tr><td>小麦</td><td>9.20</td><td>+0.05</td></tr></table>"
+)
+SPARSE_HTML = (
+    "<table>"
+    "<tr><td>A</td><td></td><td></td></tr>"
+    "<tr><td></td><td>B</td><td></td></tr>"
+    "<tr><td></td><td></td><td>C</td></tr>"
+    "<tr><td></td><td></td><td></td></tr>"
+    "</table>"
+)
+SCRAMBLED_HTML = (
+    "<table>"
+    "<tr><td>1.</td><td>--</td><td>3/</td><td></td></tr>"
+    "<tr><td>12</td><td>4</td></tr>"
+    "<tr><td>.</td><td>1.</td><td>--</td><td>9</td><td></td><td>x</td></tr>"
+    "<tr><td>2.</td></tr>"
+    "</table>"
+)
+CHART_HTML = (
+    "<table>"
+    "<tr><td></td><td>X</td><td></td><td>O</td><td></td></tr>"
+    "<tr><td>X</td><td></td><td>O</td><td></td><td>X</td></tr>"
+    "<tr><td></td><td>O</td><td></td><td>X</td><td></td></tr>"
+    "<tr><td>O</td><td></td><td>X</td><td></td><td></td></tr>"
+    "</table>"
+)
+
+
+def _decide(html, caption=None, mode="auto", page_blocks=None, bbox=None, **kw):
+    payload = {"html": html, "caption": [caption] if caption else [], "body": bbox or [0.2, 0.2, 0.8, 0.7]}
+    return p.classify_table_decision(payload, mode, page_blocks=page_blocks,
+                                     table_bbox=bbox or payload["body"], **kw)
+
+
+class TableQualityGateTests(unittest.TestCase):
+    def test_dense_good_table_stays_html(self):
+        info = _decide(DENSE_HTML, caption="表 9.1 价格")
+        self.assertEqual(info["decision"], "html", info)
+        self.assertTrue(info["scores"]["dense"])
+        self.assertGreaterEqual(info["scores"]["score"], p.DEFAULT_TABLE_MIN_QUALITY)
+        self.assertLessEqual(info["scores"]["empty"], 0.05)
+        self.assertLessEqual(info["scores"]["noise"], 0.25)
+
+    def test_sparse_table_falls_back_to_image(self):
+        info = _decide(SPARSE_HTML)
+        self.assertEqual(info["decision"], "image", info)
+        self.assertGreater(info["scores"]["empty"], p.TABLE_EMPTY_CELL_RATIO)
+        self.assertIn("empty", info["reason"])
+
+    def test_scrambled_numeric_table_falls_back_to_image(self):
+        info = _decide(SCRAMBLED_HTML)
+        self.assertEqual(info["decision"], "image", info)
+        self.assertTrue(
+            info["scores"]["cols"] > p.TABLE_COL_INCONSISTENT_RATIO
+            or info["scores"]["noise"] > p.TABLE_NOISE_CELL_RATIO,
+            info,
+        )
+
+    def test_captioned_chart_falls_back_to_image(self):
+        info = _decide(CHART_HTML, caption="图3.10 点数图")
+        self.assertEqual(info["decision"], "image", info)
+        self.assertTrue(info["scores"]["caption"])
+        self.assertTrue(
+            info["scores"]["xo"] > p.TABLE_XO_CELL_RATIO
+            or info["scores"]["empty"] > p.TABLE_EMPTY_CELL_RATIO,
+            info,
+        )
+
+    def test_figure_caption_does_not_reject_dense_grid(self):
+        # p466-style: 图 caption on a clean table must stay HTML.
+        info = _decide(DENSE_HTML, caption="图15.15 对照")
+        self.assertEqual(info["decision"], "html", info)
+        self.assertTrue(info["scores"]["caption"])
+        self.assertTrue(info["scores"]["dense"])
+        self.assertGreaterEqual(info["scores"]["score"], p.DEFAULT_TABLE_MIN_QUALITY)
+
+    def test_overlap_with_figure_region_penalises_sparse_grid(self):
+        bbox = [0.2, 0.2, 0.8, 0.7]
+        blocks = [
+            {"type": "image", "bbox": [0.15, 0.15, 0.85, 0.75], "content": ""},
+        ]
+        info = _decide(SPARSE_HTML, page_blocks=blocks, bbox=bbox)
+        self.assertEqual(info["decision"], "image", info)
+        self.assertGreaterEqual(info["scores"]["overlap"], p.TABLE_FIGURE_OVERLAP)
+
+    def test_tables_html_forces_html_despite_quality(self):
+        info = _decide(SPARSE_HTML, mode="html")
+        self.assertEqual(info["decision"], "html")
+        self.assertEqual(info["reason"], "forced-html")
+
+    def test_min_quality_knob_rejects_borderline_score(self):
+        info_lo = _decide(DENSE_HTML, caption="图15.15 对照", min_quality=0.0)
+        info_hi = _decide(DENSE_HTML, caption="图15.15 对照", min_quality=0.99)
+        self.assertEqual(info_lo["decision"], "html")
+        # dense+caption score is high but not perfect
+        self.assertLess(info_hi["scores"]["score"], 0.99)
+        self.assertEqual(info_hi["decision"], "image")
+
+    def test_build_sparse_table_emits_figure(self):
+        items = build([[table_block(SPARSE_HTML, [0.2, 0.2, 0.8, 0.7])]])
+        self.assertTrue(any(it["kind"] == "figure" for it in items))
+        self.assertFalse(any(it["kind"] == "table" for it in items))
+
+    def test_constants_match_documented_thresholds(self):
+        self.assertAlmostEqual(p.TABLE_EMPTY_CELL_RATIO, 0.40)
+        self.assertAlmostEqual(p.TABLE_NOISE_CELL_RATIO, 0.50)
+        self.assertAlmostEqual(p.TABLE_XO_CELL_RATIO, 0.25)
+        self.assertAlmostEqual(p.TABLE_COL_INCONSISTENT_RATIO, 0.40)
+        self.assertAlmostEqual(p.TABLE_SPAN_IRREGULAR_RATIO, 0.30)
+        self.assertAlmostEqual(p.DEFAULT_TABLE_MIN_QUALITY, 0.55)
 
 
 class InterleaveUnitTests(unittest.TestCase):

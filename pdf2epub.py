@@ -18,7 +18,7 @@ Usage
          [--title T] [--author A] [--dpi 300] [--workdir DIR]
          [--reuse-json] [--from-json mineru.json] [--chapter-regex RE]
          [--toc-file toc.txt] [--tables auto|html|image] [--table-images]
-         [--no-punct-normalize] [--epubcheck]
+         [--table-min-quality 0.55] [--no-punct-normalize] [--epubcheck]
 """
 from __future__ import annotations
 
@@ -81,6 +81,27 @@ _TABLE_ATTRS = {
     "col": ("span",),
     "colgroup": ("span",),
 }
+# Quality gate: unreliable OCR HTML falls back to the cropped scan.
+TABLE_EMPTY_CELL_RATIO = 0.40          # hard fail if more than this share is empty
+TABLE_NOISE_CELL_RATIO = 0.50          # hard fail: fragmentary digits / symbols
+TABLE_XO_CELL_RATIO = 0.25             # hard fail: point-and-figure X/O marks
+TABLE_COL_INCONSISTENT_RATIO = 0.40    # hard fail: row widths disagree
+TABLE_SPAN_IRREGULAR_RATIO = 0.30      # hard fail: body cells with rowspan/colspan
+TABLE_FIGURE_OVERLAP = 0.30            # overlap with an image/chart box
+DEFAULT_TABLE_MIN_QUALITY = 0.55       # combined score cutoff (--table-min-quality)
+FIGURE_CAPTION_RE = re.compile(
+    r"^(?:图|圖)\s*[\d０-９]|^(?:Figure|Fig\.?)\b",
+    re.I,
+)
+_COMPLETE_NUM_RE = re.compile(
+    r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?$"
+)
+_XO_MARK_RE = re.compile(r"^[XOxo○●〇x]+$")
+_EMPTY_CELL_RE = re.compile(r"^[\s.\-–—_·•*]+$")
+# Line-wrap after 。 is indistinguishable from a paragraph break in table HTML;
+# do not split when the next span is a mid-paragraph "for example".
+_PARA_NO_BREAK_PREFIXES = ("举例来说", "比如说", "也就是说", "换言之", "亦即")
+FIGURE_REGION_TYPES = frozenset({"image", "chart", "figure", "seal"})
 
 
 def log(msg):
@@ -601,10 +622,13 @@ class _TableWalker(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.rows: list[list[str]] = []
+        self.cell_meta: list[list[dict]] = []
         self.n_cols = 0
         self._row: list[str] | None = None
+        self._row_meta: list[dict] | None = None
         self._cell: list[str] | None = None
         self._cell_span = 1
+        self._cell_rowspan = 1
         self._row_cols = 0
         self._parts: list[str] = []
         self._stack: list[str] = []
@@ -613,16 +637,23 @@ class _TableWalker(HTMLParser):
         tag = (tag or "").lower()
         if tag == "tr":
             self._row = []
+            self._row_meta = []
             self._row_cols = 0
         elif tag in ("td", "th"):
             self._cell = []
             self._cell_span = 1
+            self._cell_rowspan = 1
             for k, v in attrs:
                 if k.lower() == "colspan":
                     try:
                         self._cell_span = max(1, int(v))
                     except (TypeError, ValueError):
                         self._cell_span = 1
+                elif k.lower() == "rowspan":
+                    try:
+                        self._cell_rowspan = max(1, int(v))
+                    except (TypeError, ValueError):
+                        self._cell_rowspan = 1
         elif tag == "br" and self._cell is not None:
             self._cell.append("\n")
         if tag not in _TABLE_TAGS:
@@ -656,13 +687,19 @@ class _TableWalker(HTMLParser):
             text = "".join(self._cell)
             if self._row is not None:
                 self._row.append(text)
+                if self._row_meta is not None:
+                    self._row_meta.append({
+                        "text": text, "colspan": self._cell_span, "rowspan": self._cell_rowspan,
+                    })
                 self._row_cols += self._cell_span
                 self.n_cols = max(self.n_cols, self._row_cols)
             self._cell = None
         elif tag == "tr" and self._row is not None:
             self.rows.append(self._row)
+            self.cell_meta.append(self._row_meta or [])
             self.n_cols = max(self.n_cols, self._row_cols, len(self._row))
             self._row = None
+            self._row_meta = None
         if tag in _TABLE_TAGS and tag not in ("br", "col"):
             if self._stack and self._stack[-1] == tag:
                 self._stack.pop()
@@ -683,21 +720,42 @@ class _TableWalker(HTMLParser):
             self._parts.append(f"</{self._stack.pop()}>")
 
 
-def parse_table_html(raw: str | None) -> tuple[list[list[str]], int, str]:
-    """Return (rows of cell texts, n_cols, sanitised XHTML)."""
+def _walk_table(raw: str | None) -> _TableWalker | None:
     if not raw or "<table" not in raw.lower():
-        return [], 0, ""
+        return None
     walker = _TableWalker()
     try:
         walker.feed(raw)
         walker.close()
         walker.finish()
     except Exception:
+        return None
+    return walker
+
+
+def parse_table_html(raw: str | None) -> tuple[list[list[str]], int, str]:
+    """Return (rows of cell texts, n_cols, sanitised XHTML)."""
+    walker = _walk_table(raw)
+    if walker is None:
         return [], 0, ""
     xhtml = "".join(walker._parts).strip()
     if "<table" not in xhtml.lower():
         xhtml = ""
     return walker.rows, walker.n_cols, xhtml
+
+
+def parse_table_analysis(raw: str | None) -> dict:
+    """Rows, column count, sanitised XHTML, and per-cell span metadata."""
+    walker = _walk_table(raw)
+    if walker is None:
+        return {"rows": [], "n_cols": 0, "xhtml": "", "cell_meta": []}
+    xhtml = "".join(walker._parts).strip()
+    if "<table" not in xhtml.lower():
+        xhtml = ""
+    return {
+        "rows": walker.rows, "n_cols": walker.n_cols, "xhtml": xhtml,
+        "cell_meta": walker.cell_meta,
+    }
 
 
 def table_html_from_rows(rows: list[list[str]]) -> str:
@@ -746,6 +804,213 @@ def is_prose_table(rows: list[list[str]], n_cols: int) -> bool:
     return False
 
 
+def is_figure_style_caption(text: str) -> bool:
+    """True for 图 / 圖 / Figure captions (not 表, which is a real table)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(FIGURE_CAPTION_RE.match(t))
+
+
+def cell_is_empty(text: str) -> bool:
+    t = (text or "").strip()
+    return (not t) or bool(_EMPTY_CELL_RE.fullmatch(t))
+
+
+def cell_is_noise(text: str) -> bool:
+    """Fragmentary digits/symbols, not a complete number or a real word."""
+    t = re.sub(r"\s+", "", text or "")
+    if not t or cell_is_empty(t):
+        return False
+    if _COMPLETE_NUM_RE.fullmatch(t):
+        return False
+    if _XO_MARK_RE.fullmatch(t):
+        return True
+    if re.search(r"[\u3400-\u9fffA-Za-z]{2,}", t):
+        return False
+    if len(t) <= 2 and not t.isalnum():
+        return True
+    if len(t) <= 2 and t.isdigit():
+        return False
+    if len(t) <= 3 and re.fullmatch(r"[.\-–—_/\\|~`'\"]+", t):
+        return True
+    if len(t) <= 4 and re.search(r"\d", t) and re.search(r"[^\d.,%\-+\u2212]", t):
+        return True
+    if t.endswith(".") and t[:-1].isdigit() and len(t) <= 4:
+        return True
+    return False
+
+
+def cell_is_xo(text: str) -> bool:
+    t = re.sub(r"\s+", "", text or "")
+    return bool(t and _XO_MARK_RE.fullmatch(t))
+
+
+def _row_width_inconsistency(widths: list[int]) -> float:
+    if len(widths) < 2:
+        return 0.0
+    ordered = sorted(widths)
+    med = ordered[len(ordered) // 2]
+    if med <= 0:
+        return 1.0
+    return sum(1 for w in widths if w != med) / len(widths)
+
+
+def bbox_overlap_ratio(a, b) -> float:
+    """Intersection over area of *a* (0 if either box is missing)."""
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return 0.0
+    ix0, iy0 = max(float(a[0]), float(b[0])), max(float(a[1]), float(b[1]))
+    ix1, iy1 = min(float(a[2]), float(b[2])), min(float(a[3]), float(b[3]))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    area = (float(a[2]) - float(a[0])) * (float(a[3]) - float(a[1]))
+    if area <= 0:
+        return 0.0
+    return ((ix1 - ix0) * (iy1 - iy0)) / area
+
+
+def _bboxes_near(a, b, gap: float = 0.08) -> bool:
+    if bbox_overlap_ratio(a, b) > 0:
+        return True
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return False
+    horiz = not (float(b[2]) < float(a[0]) or float(b[0]) > float(a[2]))
+    if not horiz:
+        return False
+    if float(b[3]) <= float(a[1]) + 0.02 and float(a[1]) - float(b[3]) <= gap:
+        return True
+    if float(a[3]) <= float(b[1]) + 0.02 and float(b[1]) - float(a[3]) <= gap:
+        return True
+    return False
+
+
+def collect_figure_signals(table_bbox, page_blocks, own_captions) -> tuple[bool, float]:
+    """Figure-style caption (own or nearby) and max overlap with an image/chart."""
+    captions = [c for c in (own_captions or []) if c]
+    overlap = 0.0
+    for b in page_blocks or []:
+        if not isinstance(b, dict):
+            continue
+        bb = b.get("bbox")
+        bt = b.get("type") or ""
+        if bt in FIGURE_REGION_TYPES and bb:
+            overlap = max(overlap, bbox_overlap_ratio(table_bbox, bb))
+        texts: list[str] = []
+        if bt in TITLE_TYPES or bt in ("text", "paragraph_title") or bt.endswith("caption"):
+            texts.append(block_text(b.get("content")))
+        if isinstance(b.get("content"), list):
+            for sub in b["content"]:
+                if not isinstance(sub, dict):
+                    continue
+                st = str(sub.get("type") or "")
+                if st.endswith("_caption"):
+                    cap = block_text(sub.get("content"))
+                    texts.append(cap)
+                    if sub.get("bbox") and table_bbox and _bboxes_near(table_bbox, sub["bbox"]):
+                        captions.append(cap)
+        for t in texts:
+            if not is_figure_style_caption(t):
+                continue
+            if bb and table_bbox and _bboxes_near(table_bbox, bb):
+                captions.append(t)
+            elif not bb and not table_bbox:
+                captions.append(t)
+    fig_cap = any(is_figure_style_caption(t) for t in captions)
+    return fig_cap, overlap
+
+
+def table_quality(rows: list[list[str]], cell_meta: list[list[dict]] | None,
+                  captions: list[str] | None = None, table_bbox=None,
+                  page_blocks=None, min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> dict:
+    """Score recognised table HTML; ok=False means fall back to the image crop."""
+    meta = cell_meta or [[{"text": c, "colspan": 1, "rowspan": 1} for c in row] for row in rows]
+    cells = [c for row in rows for c in row]
+    n = len(cells)
+    fig_cap, overlap = collect_figure_signals(table_bbox, page_blocks, captions)
+    if n == 0:
+        return {
+            "ok": False, "reason": "no-cells",
+            "empty": 1.0, "noise": 1.0, "xo": 0.0, "cols": 1.0, "span": 0.0,
+            "caption": fig_cap, "overlap": overlap, "score": 0.0, "dense": False,
+        }
+    empty_n = sum(1 for c in cells if cell_is_empty(c))
+    empty_ratio = empty_n / n
+    nonempty = [c for c in cells if not cell_is_empty(c)]
+    noise_n = sum(1 for c in nonempty if cell_is_noise(c))
+    noise_ratio = noise_n / len(nonempty) if nonempty else 1.0
+    xo_n = sum(1 for c in nonempty if cell_is_xo(c))
+    xo_ratio = xo_n / len(nonempty) if nonempty else 0.0
+    if meta and any(meta):
+        widths = [sum(int(m.get("colspan") or 1) for m in row) for row in meta]
+    else:
+        widths = [len(r) for r in rows]
+    col_inconsist = _row_width_inconsistency(widths)
+    body = [m for i, row in enumerate(meta) for m in row if i > 0]
+    span_n = sum(1 for m in body if int(m.get("colspan") or 1) > 1 or int(m.get("rowspan") or 1) > 1)
+    span_ratio = span_n / len(body) if body else 0.0
+    dense = (
+        empty_ratio <= 0.20 and noise_ratio <= 0.25 and col_inconsist <= 0.20
+        and xo_ratio <= 0.10 and n >= 4
+    )
+    reasons: list[str] = []
+    if empty_ratio > TABLE_EMPTY_CELL_RATIO:
+        reasons.append("empty")
+    if noise_ratio > TABLE_NOISE_CELL_RATIO:
+        reasons.append("noise")
+    if xo_ratio > TABLE_XO_CELL_RATIO:
+        reasons.append("chart-marks")
+    if col_inconsist > TABLE_COL_INCONSISTENT_RATIO:
+        reasons.append("scrambled-cols")
+    if span_ratio > TABLE_SPAN_IRREGULAR_RATIO:
+        reasons.append("irregular-spans")
+    score = 1.0
+    score -= 0.9 * max(0.0, empty_ratio - 0.10) / 0.50
+    score -= 0.9 * max(0.0, noise_ratio - 0.15) / 0.55
+    score -= 0.8 * col_inconsist
+    score -= 0.6 * span_ratio
+    score -= 0.8 * xo_ratio
+    if fig_cap:
+        score -= 0.08 if dense else 0.28
+    if overlap >= TABLE_FIGURE_OVERLAP:
+        score -= 0.08 if dense else 0.25
+    score = max(0.0, min(1.0, score))
+    if reasons:
+        reason = "+".join(reasons)
+        if fig_cap:
+            reason = "figure-caption+" + reason
+        elif overlap >= TABLE_FIGURE_OVERLAP:
+            reason = "figure-overlap+" + reason
+        ok = False
+    elif score < min_quality:
+        ok = False
+        reason = "figure-caption+low-score" if fig_cap else "low-score"
+    else:
+        ok = True
+        reason = "quality-ok"
+    return {
+        "ok": ok, "reason": reason, "empty": empty_ratio, "noise": noise_ratio,
+        "xo": xo_ratio, "cols": col_inconsist, "span": span_ratio,
+        "caption": fig_cap, "overlap": overlap, "score": score, "dense": dense,
+    }
+
+
+def format_table_decision_log(page: int, info: dict) -> str:
+    s = info.get("scores") or info
+    if info.get("decision") == "prose":
+        return (
+            f"page {page}: table → prose ({info.get('reason')}; "
+            f"cells={s.get('cells', '?')} cols={s.get('cols', '?')} avg={s.get('avg', 0):.0f})"
+        )
+    return (
+        f"page {page}: table → {info.get('decision')} ({info.get('reason')}; "
+        f"empty={s.get('empty', 0):.2f} noise={s.get('noise', 0):.2f} "
+        f"xo={s.get('xo', 0):.2f} cols={s.get('cols', 0):.2f} "
+        f"span={s.get('span', 0):.2f} cap={int(bool(s.get('caption')))} "
+        f"ov={s.get('overlap', 0):.2f} score={s.get('score', 0):.2f})"
+    )
+
+
 def split_ocr_paragraphs(text: str) -> list[str]:
     """Split a cell whose OCR joined lines with spaces into paragraphs.
 
@@ -759,7 +1024,13 @@ def split_ocr_paragraphs(text: str) -> list[str]:
     if not s:
         return []
     parts = [p.strip() for p in _PARA_SPLIT_RE.split(s) if p and p.strip()]
-    return parts or [s]
+    merged: list[str] = []
+    for part in parts:
+        if merged and part.startswith(_PARA_NO_BREAK_PREFIXES):
+            merged[-1] += part
+        else:
+            merged.append(part)
+    return merged or [s]
 
 
 def _distribute_vertical_bboxes(bbox, weights) -> list[list[float]]:
@@ -844,18 +1115,47 @@ def extract_table_payload(block: dict) -> dict:
     return {"body": body, "caption": caption, "footnote": foot, "html": table_html}
 
 
-def classify_table_decision(payload: dict, table_mode: str) -> str:
-    """Return 'prose', 'html', or 'image'."""
+def classify_table_decision(payload: dict, table_mode: str,
+                            page_blocks=None, table_bbox=None,
+                            min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> dict:
+    """Decide prose / html / image. Auto: prose, then quality gate, then HTML."""
     mode = table_mode if table_mode in TABLE_MODES else "auto"
+    try:
+        min_quality = float(min_quality)
+    except (TypeError, ValueError):
+        min_quality = DEFAULT_TABLE_MIN_QUALITY
+    min_quality = max(0.0, min(1.0, min_quality))
     raw = payload.get("html")
+    analysis = parse_table_analysis(raw)
+    rows, n_cols = analysis["rows"], analysis["n_cols"]
+    q = table_quality(
+        rows, analysis.get("cell_meta"),
+        captions=payload.get("caption") or [],
+        table_bbox=table_bbox or payload.get("body"),
+        page_blocks=page_blocks,
+        min_quality=min_quality,
+    )
+    scores = {k: q[k] for k in (
+        "empty", "noise", "xo", "cols", "span", "caption", "overlap", "score", "dense",
+    )}
     if mode == "image" or not raw:
-        return "image"
-    rows, n_cols, _ = parse_table_html(raw)
+        return {"decision": "image", "reason": "mode=image" if mode == "image" else "no-html",
+                "scores": scores, "analysis": analysis}
     if mode == "html":
-        return "html"
+        return {"decision": "html", "reason": "forced-html", "scores": scores, "analysis": analysis}
     if is_prose_table(rows, n_cols):
-        return "prose"
-    return "html"
+        cells = [c for row in rows for c in row]
+        total = sum(cell_plain_len(c) for c in cells) if cells else 0
+        avg = total / len(cells) if cells else 0
+        return {
+            "decision": "prose",
+            "reason": "long sentence-like cells",
+            "scores": {"cells": len(cells), "cols": n_cols, "avg": avg},
+            "analysis": analysis,
+        }
+    if not q["ok"]:
+        return {"decision": "image", "reason": q["reason"], "scores": scores, "analysis": analysis}
+    return {"decision": "html", "reason": q["reason"], "scores": scores, "analysis": analysis}
 
 
 def _is_margin_heading(it: dict) -> bool:
@@ -951,7 +1251,8 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
                    toc_entries: list[dict] | None = None,
                    chapter_max_len: int | None = 48,
                    table_mode: str = "auto",
-                   table_images: bool = False) -> list[dict]:
+                   table_images: bool = False,
+                   table_min_quality: float = DEFAULT_TABLE_MIN_QUALITY) -> list[dict]:
     """Build the linear document stream. Figure crops are skipped when PNGs are missing."""
     if page_info is None:
         page_info = page_info_from_mineru(mj)
@@ -988,11 +1289,17 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
             x0, y0, x1, y1 = b["bbox"]
             if t in DROP_TYPES:
                 continue
-            if t == "table" and table_mode != "image":
+            if t == "table":
                 payload = extract_table_payload(b)
-                decision = classify_table_decision(payload, table_mode)
-                rows, _n_cols, xhtml = parse_table_html(payload.get("html"))
-                if decision == "prose" and rows:
+                info = classify_table_decision(
+                    payload, table_mode, page_blocks=p.get("blocks"),
+                    table_bbox=b.get("bbox"), min_quality=table_min_quality,
+                )
+                log(format_table_decision_log(pidx + 1, info))
+                analysis = info.get("analysis") or parse_table_analysis(payload.get("html"))
+                rows, xhtml = analysis.get("rows") or [], analysis.get("xhtml") or ""
+                decision = info["decision"]
+                if table_mode != "image" and decision == "prose" and rows:
                     exploded = prose_table_to_paras(
                         rows, payload.get("body") or b["bbox"], pidx + 1,
                         punct, height_pt, width_pt,
@@ -1011,7 +1318,7 @@ def build_document(mj: dict, page_info: list[dict] | None, img_dir: Path | None,
                                 continue
                         items.append(it)
                     continue
-                if decision == "html":
+                if table_mode != "image" and decision == "html":
                     table_xhtml = xhtml or sanitize_table_html(payload.get("html"))
                     if table_xhtml:
                         fig_no += 1
@@ -1314,6 +1621,10 @@ def main(argv: list[str] | None = None):
                          "html = always emit recognised HTML; image = crop only (legacy)")
     ap.add_argument("--table-images", action="store_true", dest="table_images",
                     help="also embed the cropped scan of real tables next to the HTML")
+    ap.add_argument("--table-min-quality", type=float, default=DEFAULT_TABLE_MIN_QUALITY,
+                    dest="table_min_quality",
+                    help="auto mode: emit HTML only when the quality score is at least this "
+                         f"(default {DEFAULT_TABLE_MIN_QUALITY}); lower keeps more HTML")
     ap.add_argument("--no-punct-normalize", action="store_true")
     ap.add_argument("--epubcheck", action="store_true", help="run epubcheck if available")
     a = ap.parse_args(argv)
@@ -1367,6 +1678,7 @@ def main(argv: list[str] | None = None):
         mj, page_info, work / "images", punct=not a.no_punct_normalize,
         chapter_re=chapter_re, toc_entries=toc_entries, chapter_max_len=chapter_max_len,
         table_mode=a.tables, table_images=a.table_images,
+        table_min_quality=a.table_min_quality,
     )
     try:
         draw_overlays(mj, page_info, work / "layout")
