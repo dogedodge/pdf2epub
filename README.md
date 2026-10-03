@@ -22,6 +22,8 @@ python pdf2epub.py book.pdf -o out/book.epub --title "书名" --author "作者" 
 #   --from-json FILE  same rebuild from a MinerU JSON path (PDF / page images optional)
 #   --chapter-regex RE   override the default Chinese chapter-title pattern
 #   --toc-file FILE   user TOC (one title per line; indent = nesting; optional page number)
+#   --tables auto     (default) mislabelled prose "tables" → paragraphs; real tables stay cropped images
+#   --tables image    crop every table as a picture (never convert to prose)
 #   --no-punct-normalize   keep OCR punctuation as-is
 ```
 Intermediates go to `<out>_work/` (or `--workdir`):
@@ -58,6 +60,28 @@ levels for titles it can match, in document order:
 (no PDF, no re-OCR). Missing page PNGs skip figure crops but keep captions and reading order.
 `--reuse-json` still reads `mineru_<tier>.json` from the work dir when a PDF is given.
 
+### Tables (MinerU `table` blocks)
+MinerU 4 basic often wraps a whole text column as one `table` whose `table_body` is
+HTML (sometimes two tall `<td>` cells of prose). Cropping that box as an image
+threw the body text away, and left-margin titles such as `总结` / `结语` were
+emitted *after* the picture.
+
+`--tables auto` (default) only special-cases that mislabelled prose:
+
+* **Prose table** — few columns, long sentence-like cells → split into paragraphs
+  (OCR joins wrapped lines with spaces; a new indented paragraph shows up as
+  `。` + space, except mid-paragraph openers such as `举例来说`). Left-margin
+  headings are inserted by vertical position so they sit between the right-hand
+  paragraphs. Cross-page merging still applies to the first/last paragraph of
+  the exploded table. Short leftovers in the footer band (`y > 0.90`) are dropped
+  so they do not block the merge.
+* **Real table** — everything else is cropped from the page render and emitted
+  as a figure with its caption, same as before this change.
+
+`--tables image` crops every table and never converts cells to paragraphs.
+
+CJK spaces inside exploded cells are stripped the same way as body text.
+
 Tests: `python -m unittest discover -s tests`. Synthetic fixtures only are in-repo; a real
 MinerU dump can be pointed at with `MINERU_BASIC_JSON` (do not commit scanned books).
 
@@ -74,11 +98,11 @@ MinerU dump can be pointed at with `MINERU_BASIC_JSON` (do not commit scanned bo
 ## Pipeline steps (see pdf2epub.py)
 1. `inspect_and_render` – PyMuPDF: page sizes, image coverage, text layer / invisible spans, 300-DPI PNG.
 2. `run_mineru` – layout (PP-DocLayoutV2) + OCR (PP-OCRv6), reading order, block types.
-3. `build_document` – crop `image/chart/table/...` bodies from the 300-DPI render (normalised
-   bbox + 0.8 % padding), attach captions.
+3. `build_document` – crop `image/chart/...` bodies from the 300-DPI render (normalised
+   bbox + 0.8 % padding), attach captions; classify `table` blocks (see above).
 4. Cleaning – drop `header/footer/page_number`, merge `continues_prev` blocks (+ fallback:
    first text on a page joins previous paragraph if it lacks terminal punctuation),
    CJK punctuation normalisation, chapter titles from a Chinese regex (size / per-line
    height only to rank remaining h2/h3).
-5. `build_epub` – one XHTML per h1 chapter, h2/h3 nested in the TOC, figures with `<figcaption>`, CSS
-   with 2em indent, nav + NCX, `zh-CN` metadata; optional epubcheck.
+5. `build_epub` – one XHTML per h1 chapter, h2/h3 nested in the TOC, figures with `<figcaption>`,
+   CSS with 2em indent, nav + NCX, `zh-CN` metadata; optional epubcheck.
